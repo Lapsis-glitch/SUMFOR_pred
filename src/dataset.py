@@ -52,6 +52,7 @@ def spectrum_to_vector(mz, intensities, max_mz=2000):
 
 
 class SpectrumFormulaDataset(Dataset):
+    """Sequence‑based dataset: returns (spectrum, token_ids)."""
     def __init__(self, entries, tokenizer, max_mz=2000, max_len=30):
         self.entries = [e for e in entries if "Formula" in e]
         self.tokenizer = tokenizer
@@ -73,3 +74,37 @@ class SpectrumFormulaDataset(Dataset):
         spectrum = torch.tensor(spectrum, dtype=torch.float32)
         tokens = torch.tensor(tokens, dtype=torch.long)
         return spectrum, tokens
+
+
+# -----------------------------
+# Count‑based helpers and dataset
+# -----------------------------
+def formula_to_counts(formula: str, element_order):
+    """
+    Convert a formula string into a vector of counts in the given element order.
+    Example: "C2H10O" with element_order ["C","H","N","O","S"] -> [2,10,0,1,0]
+    """
+    counts = {e: 0 for e in element_order}
+    for elem, num in re.findall(r'([A-Z][a-z]*)(\d*)', formula):
+        if elem in counts:
+            counts[elem] += int(num) if num else 1
+    return [counts[e] for e in element_order]
+
+
+class SpectrumCountDataset(Dataset):
+    """Count‑based dataset: returns (spectrum, count_vector)."""
+    def __init__(self, entries, element_order, max_mz=2000):
+        self.entries = [e for e in entries if "Formula" in e]
+        self.element_order = element_order
+        self.max_mz = max_mz
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __getitem__(self, idx):
+        entry = self.entries[idx]
+        spectrum = spectrum_to_vector(entry['mz'], entry['intensities'], self.max_mz)
+        counts = formula_to_counts(entry['Formula'], self.element_order)
+        spectrum = torch.tensor(spectrum, dtype=torch.float32)
+        counts = torch.tensor(counts, dtype=torch.float32)
+        return spectrum, counts

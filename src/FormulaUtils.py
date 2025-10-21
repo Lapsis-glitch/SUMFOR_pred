@@ -1,5 +1,6 @@
 import re
 from collections import defaultdict
+import torch
 
 
 class FormulaUtils:
@@ -23,8 +24,32 @@ class FormulaUtils:
 
     @classmethod
     def compute_mass(cls, fdict: dict) -> float:
-        """Compute monoisotopic mass from element counts."""
+        """Compute monoisotopic mass from element counts (dict)."""
         return sum(cls.ATOMIC_MASS.get(e, 0) * c for e, c in fdict.items())
+
+    @classmethod
+    def compute_mass_from_counts(cls, counts, element_order):
+        """
+        Compute molecular mass from element count vectors.
+
+        Args:
+            counts: torch.Tensor or numpy array of shape (E,) or (B, E)
+                    containing element counts (not log1p).
+            element_order: list of element symbols in the same order as counts.
+
+        Returns:
+            torch.Tensor of shape (B,) with masses if input is 2D,
+            or scalar tensor if input is 1D.
+        """
+        if not isinstance(counts, torch.Tensor):
+            counts = torch.tensor(counts, dtype=torch.float32)
+
+        if counts.dim() == 1:
+            counts = counts.unsqueeze(0)
+
+        masses = torch.tensor([cls.ATOMIC_MASS[e] for e in element_order],
+                              device=counts.device, dtype=counts.dtype)
+        return (counts * masses).sum(dim=1)
 
     @staticmethod
     def relaxed_hc_rule(C: int, H: int) -> bool:

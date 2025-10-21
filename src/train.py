@@ -1,58 +1,27 @@
 import os
-import random
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from sklearn.model_selection import train_test_split
+import collections
 
-from dataset import SpectrumFormulaDataset, FormulaTokenizer
-from model import Spectrum2Formula   # hybrid version with use_formula_transformer=True
+from dataset import SpectrumCountDataset
+from model import Spectrum2Counts
 from src.DatasetBuilder import DatasetBuilder
 from src.FormulaUtils import FormulaUtils
-from src.Trainer import Trainer
-from src.BeamDecoder import BeamSearchDecoder
+from src.CountTrainer import CountTrainer
 from src.data_extract import parse_msp
 
 
-# -----------------------------
-# Candidate sampler factory
-# -----------------------------
-def candidate_sampler_factory(all_elem_targets, mass_targets, mass_tol=0.5, num_neg=15):
-    """
-    Returns a function that samples negatives for a given index.
-    - all_elem_targets: tensor (N, E) element counts
-    - mass_targets: tensor (N,) precursor masses
-    - mass_tol: deviation in Da for negatives
-    - num_neg: number of negatives per sample
-    """
-    N, E = all_elem_targets.size()
-
-    def sampler(idx):
-        true_mass = mass_targets[idx].item()
-        # indices with similar mass but different formula
-        candidates = [j for j in range(N)
-                      if j != idx and abs(mass_targets[j].item() - true_mass) < mass_tol]
-        if len(candidates) < num_neg:
-            candidates = random.sample(range(N), num_neg)
-        else:
-            candidates = random.sample(candidates, num_neg)
-        return all_elem_targets[candidates]  # (num_neg, E)
-
-    return sampler
-
-
-# -----------------------------
-# Helper: convert decoded formulas to count tensors
-# -----------------------------
-def formulas_to_counts(formulas, element_order):
-    """
-    Convert list of formula strings to (K, E) count tensor.
-    """
-    counts = []
-    for f in formulas:
-        fdict = FormulaUtils.parse_formula_dict(f)
-        counts.append([fdict.get(e, 0) for e in element_order])
-    return torch.tensor(counts, dtype=torch.float32)
+def counts_to_formula(counts, element_order):
+    """Convert a count vector into a formula string, skipping zero counts."""
+    parts = []
+    for elem, c in zip(element_order, counts):
+        c = int(c)
+        if c > 0:
+            parts.append(elem)
+            if c > 1:
+                parts.append(str(c))
+    return "".join(parts) if parts else "EMPTY"
 
 
 def main():
@@ -61,8 +30,7 @@ def main():
     print(f"Parsed {len(spectra)} entries")
 
     # --- Build dataset (CHONS only) ---
-    tokenizer = FormulaTokenizer()  # multi-digit counts tokenizer
-    builder = DatasetBuilder(spectra, tokenizer, max_mz=1000, max_len=30,
+    builder = DatasetBuilder(spectra, None, max_mz=1000, max_len=30,
                              allowed_elements={"C", "H", "O", "N", "S"})
     filtered_spectra = builder.filter_spectra()
     print(f"Filtered dataset (CHONS only): {len(filtered_spectra)} valid formulas out of {len(spectra)}")
@@ -71,46 +39,57 @@ def main():
     num_elements = len(ELEMENT_ORDER)
 
     elem_targets_all, mass_targets_all = builder.build_targets(filtered_spectra, ELEMENT_ORDER)
-    dataset = SpectrumFormulaDataset(filtered_spectra, tokenizer, max_mz=1000, max_len=30)
+    dataset = SpectrumCountDataset(filtered_spectra, ELEMENT_ORDER, max_mz=1000)
 
     # --- Train/val split ---
     indices = list(range(len(dataset)))
     train_idx, val_idx = train_test_split(indices, test_size=0.1, random_state=42)
 
-    train_loader = DataLoader(Subset(dataset, train_idx), batch_size=256, shuffle=True,
-                              num_workers=4, pin_memory=True)
+    # --- Build weights for rebalancing (based on carbon count) ---
+    carbon_counts = [FormulaUtils.parse_formula_dict(filtered_spectra[i]["Formula"]).get("C", 0)
+                     for i in train_idx]
+    freq = collections.Counter(carbon_counts)
+    weights = [1.0 / freq[c] for c in carbon_counts]
+
+    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+    train_loader = DataLoader(Subset(dataset, train_idx), batch_size=256,
+                              sampler=sampler, num_workers=4, pin_memory=True)
     val_loader = DataLoader(Subset(dataset, val_idx), batch_size=1, shuffle=False,
                             num_workers=2, pin_memory=True)
 
     # --- Model + Optimizer ---
-    model = Spectrum2Formula(
+    model = Spectrum2Counts(
         input_dim=1000,
-        vocab_size=len(tokenizer.vocab),
         embed_dim=256,
         n_layers=4,
         n_heads=4,
         ff_dim=1024,
         num_elements=num_elements,
-        use_presence_head=True,
-        use_formula_transformer=True  # enable formula scoring head
+        use_presence_head=True
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # Different LR for element head vs rest
-    elem_params = list(model.elem_head.parameters())
-    other_params = [p for n, p in model.named_parameters() if not any(ep is p for ep in elem_params)]
-    optimizer = torch.optim.Adam([
-        {"params": other_params, "lr": 1e-4},
-        {"params": elem_params, "lr": 5e-4}
-    ])
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.stoi["<pad>"])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda")
+
+    # --- Scheduler: cosine with warmup ---
+    total_steps = len(train_loader) * 150
+    warmup_steps = max(500, len(train_loader) * 3)
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.1415926535))).item()
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # --- Resume from checkpoint if available ---
     start_epoch = 0
     best_val_acc = 0.0
-    checkpoint_path = "checkpoint_epoch_150.pt"
+    checkpoint_path = "checkpoint_counts.pt"
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
@@ -119,157 +98,111 @@ def main():
         best_val_acc = checkpoint.get("val_acc", 0.0)
         print(f"Resumed from checkpoint at epoch {start_epoch}, "
               f"Val Acc {best_val_acc:.3f}, "
-              f"Elem Acc {checkpoint.get('val_elem_acc', 0):.3f}, "
               f"Loss {checkpoint.get('loss', 0):.4f}")
 
-    # --- Trainer + Decoder ---
-    trainer = Trainer(
-        model, optimizer, criterion, device, scaler,
-        lambda_elem_start=0.1, lambda_elem_max=0.5,
-        lambda_mass=1e-4, use_presence=True, ramp_epochs=10,
-        lambda_consistency=0.01, lambda_seq_mass=1e-4,
-        lambda_formula_rank=1e-3  # weight for ranking loss
+    # --- Trainer ---
+    trainer = CountTrainer(
+        model, optimizer, device, scaler,
+        lambda_elem_start=0.2, lambda_elem_max=0.8,
+        lambda_mass_penalty=0.2,
+        lambda_presence=0.1,
+        lambda_diversity=0.02,
+        lambda_entropy=0.01,
+        use_presence=True, ramp_epochs=10,
+        element_order=ELEMENT_ORDER,
+        element_weights=[1.0, 1.0, 2.0, 2.0, 3.0]  # emphasize N/O/S
     )
-
-    decoder = BeamSearchDecoder(
-        tokenizer,
-        penalty_weight=1.0,
-        mass_tol=0.3,
-        repetition_penalty=1.2,
-        length_penalty=1.0,
-        no_repeat_ngram=2
-    )
-
-    # --- Candidate sampler ---
-    candidate_sampler = candidate_sampler_factory(elem_targets_all, mass_targets_all,
-                                                  mass_tol=0.5, num_neg=15)
 
     # --- Training loop ---
     num_epochs = 150
-    K = 5
 
     for epoch in range(start_epoch, num_epochs):
-        total_ce = total_elem = total_mass = total_pres = total_cons = total_seq_mass = total_rank = total_loss = 0.0
+        total_elem = total_mass_pen = total_pres = total_div = total_ent = total_loss = 0.0
 
-        for batch_i, (spectrum, tokens) in enumerate(train_loader):
-            spectrum = spectrum.to(device)
-            tokens = tokens.to(device)
+        for batch_i, (spectrum, counts) in enumerate(train_loader):
+            spectrum, counts = spectrum.to(device), counts.to(device)
 
+            # batch_indices must align with train_idx
             start = batch_i * train_loader.batch_size
             end = start + spectrum.size(0)
             batch_indices = train_idx[start:end]
 
-            ce_l, elem_l, mass_l, pres_l, cons_l, seq_mass_l, rank_l, loss = trainer.train_step(
-                (spectrum, tokens),
+            losses = trainer.train_step(
+                (spectrum, counts),
                 elem_targets_all, mass_targets_all,
                 batch_indices,
-                epoch=epoch,
-                tokenizer=tokenizer,
-                element_order=ELEMENT_ORDER,
-                candidate_sampler=candidate_sampler
+                epoch=epoch
             )
 
-            total_ce += ce_l
-            total_elem += elem_l
-            total_mass += mass_l
-            total_pres += pres_l
-            total_cons += cons_l
-            total_seq_mass += seq_mass_l
-            total_rank += rank_l
-            total_loss += loss
+            total_elem += losses["elem_loss"]
+            total_mass_pen += losses["mass_penalty"]
+            total_pres += losses["pres_loss"]
+            total_div += losses["diversity_penalty"]
+            total_ent += losses["entropy_loss"]
+            total_loss += losses["total_loss"]
 
-        avg_ce = total_ce / len(train_loader)
+            scheduler.step()
+
         avg_elem = total_elem / len(train_loader)
-        avg_mass = total_mass / len(train_loader)
+        avg_mass_pen = total_mass_pen / len(train_loader)
         avg_pres = total_pres / len(train_loader)
-        avg_cons = total_cons / len(train_loader)
-        avg_seq_mass = total_seq_mass / len(train_loader)
-        avg_rank = total_rank / len(train_loader)
+        avg_div = total_div / len(train_loader)
+        avg_ent = total_ent / len(train_loader)
         avg_loss = total_loss / len(train_loader)
 
-        # --- Validation with optional re-ranking ---
-        correct_top1, total, avg_conf = 0, 0, 0.0
-        elem_correct_top1, elem_total_top1 = 0, 0
-        hitk_count = 0
-        elem_correct_topk, elem_total_topk = 0, 0
+        # --- Validation ---
+        elem_correct, elem_total = 0, 0
+        per_elem_correct = {e: 0 for e in ELEMENT_ORDER}
+        per_elem_total = {e: 0 for e in ELEMENT_ORDER}
+        sample_prints = 0
 
-        for i, (spectrum, tokens) in enumerate(val_loader):
-            spectrum = spectrum.to(device)
-            true_formula = tokenizer.decode(tokens[0].tolist())
+        for spectrum, counts in val_loader:
+            spectrum, counts = spectrum.to(device), counts.to(device)
+            with torch.no_grad():
+                outputs = model(spectrum)
+                if trainer.use_presence:
+                    elem_pred, presence_logits = outputs
+                else:
+                    elem_pred = outputs
 
-            # Beam decode candidates
-            preds = decoder.decode(
-                model, spectrum[0], device=device,
-                precursor_mass=None, formula_utils=FormulaUtils,
-                return_k=K,
-                element_order=ELEMENT_ORDER
-            )
+                pred_counts = elem_pred.round().clamp(min=0).int().cpu().numpy()[0]
+                true_counts = counts.cpu().numpy()[0]
 
-            # Optional re-ranking with formula head
-            # Build (K, E) counts tensor and score with model.score_formulas
-            candidate_formulas = [f for f, _ in preds]
-            candidate_counts = formulas_to_counts(candidate_formulas, ELEMENT_ORDER).unsqueeze(0)  # (1, K, E)
-            candidate_counts = torch.log1p(candidate_counts).to(device)
-            energies = model.score_formulas(spectrum, candidate_counts)  # (1, K)
-            reranked = sorted(zip(candidate_formulas, energies.squeeze(0).tolist()),
-                              key=lambda x: x[1], reverse=True)
-            best_formula, best_energy = reranked[0]
-            avg_conf += best_energy  # energy as confidence proxy
+                for elem, pc, tc in zip(ELEMENT_ORDER, pred_counts, true_counts):
+                    if pc == tc:
+                        elem_correct += 1
+                        per_elem_correct[elem] += 1
+                    per_elem_total[elem] += 1
+                    elem_total += 1
 
-            if best_formula == true_formula:
-                correct_top1 += 1
-            total += 1
+                if sample_prints < 5:
+                    pred_formula = counts_to_formula(pred_counts, ELEMENT_ORDER)
+                    true_formula = counts_to_formula(true_counts, ELEMENT_ORDER)
+                    print(f"[Val sample {sample_prints}] True: {true_formula} | Pred: {pred_formula}")
+                    sample_prints += 1
 
-            c1, t1 = FormulaUtils.element_accuracy(true_formula, best_formula)
-            elem_correct_top1 += c1
-            elem_total_top1 += t1
-
-            # Hit@K: any exact match among beams (pre-rerank for strictness)
-            if any(f == true_formula for f, _ in preds):
-                hitk_count += 1
-
-            # Element accuracy@K: best candidate across K (post-rerank doesn't change max achievable)
-            best_c, best_t = 0, 0
-            for f, _ in preds:
-                c, t = FormulaUtils.element_accuracy(true_formula, f)
-                if c > best_c:
-                    best_c, best_t = c, t
-            elem_correct_topk += best_c
-            elem_total_topk += best_t
-
-            if i < 5:
-                print(f"[Val sample {i}] True: {true_formula}")
-                for rank, (formula, energy) in enumerate(reranked[:K], 1):
-                    print(f"   Top{rank}: {formula} | Score: {energy:.3f}")
-
-        acc_top1 = correct_top1 / total if total > 0 else 0.0
-        elem_acc_top1 = elem_correct_top1 / elem_total_top1 if elem_total_top1 > 0 else 0.0
-        hit_at_k = hitk_count / total if total > 0 else 0.0
-        elem_acc_topk = elem_correct_topk / elem_total_topk if elem_total_topk > 0 else 0.0
-        avg_conf /= max(total, 1)
+        elem_acc = elem_correct / elem_total if elem_total > 0 else 0.0
 
         print(
             f"Epoch {epoch+1}, Loss {avg_loss:.4f} "
-            f"(CE {avg_ce:.4f}, Elem {avg_elem:.4f}, Mass {avg_mass:.4f}, "
-            f"Pres {avg_pres:.4f}, Cons {avg_cons:.4f}, SeqMass {avg_seq_mass:.4f}, Rank {avg_rank:.4f}), "
-            f"Val Acc@1 {acc_top1:.3f}, Elem Acc@1 {elem_acc_top1:.3f}, "
-            f"Hit@{K} {hit_at_k:.3f}, Elem Acc@{K} {elem_acc_topk:.3f}, "
-            f"Avg Score {avg_conf:.3f}"
+            f"(Elem {avg_elem:.4f}, MassPen {avg_mass_pen:.4f}, "
+            f"Pres {avg_pres:.4f}, Div {avg_div:.4f}, Ent {avg_ent:.4f}), "
+            f"Val Elem Acc {elem_acc:.3f}"
         )
+        for elem in ELEMENT_ORDER:
+            acc = per_elem_correct[elem] / per_elem_total[elem] if per_elem_total[elem] > 0 else 0.0
+            print(f"    {elem} Acc: {acc:.3f}")
 
-        # Save best model by Acc@1
-        if acc_top1 > best_val_acc:
-            best_val_acc = acc_top1
+        # Save best model
+        if elem_acc > best_val_acc:
+            best_val_acc = elem_acc
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": avg_loss,
-                "val_acc": acc_top1,
-                "val_elem_acc": elem_acc_top1,
-                "hit_at_k": hit_at_k,
-                "elem_acc_topk": elem_acc_topk,
-            }, "best_model.pt")
+                "val_acc": elem_acc,
+            }, "best_model_counts.pt")
             print(f"✅ Saved best model at epoch {epoch + 1}")
 
         # Periodic checkpointing
@@ -279,13 +212,10 @@ def main():
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": avg_loss,
-                "val_acc": acc_top1,
-                "val_elem_acc": elem_acc_top1,
-                "hit_at_k": hit_at_k,
-                "elem_acc_topk": elem_acc_topk,
-            }, f"checkpoint_epoch_{epoch + 1}.pt")
+                "val_acc": elem_acc,
+            }, f"checkpoint_counts_epoch_{epoch + 1}.pt")
             print(f"💾 Checkpoint saved at epoch {epoch + 1}")
-
 
 if __name__ == "__main__":
     main()
+
