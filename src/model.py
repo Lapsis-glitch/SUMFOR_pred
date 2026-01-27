@@ -1,233 +1,182 @@
+import math
+import torch
+
+def sinusoidal_embed(x, d_model):
+    """
+    Sinusoidal embedding of continuous values (like normalized m/z).
+    Args:
+        x: (B, T) tensor of values in [0,1] or normalized range
+        d_model: embedding dimension (must be even ideally)
+    Returns:
+        (B, T, d_model) sinusoidal embedding
+    """
+    device = x.device
+    half = d_model // 2
+    freqs = torch.exp(torch.linspace(0, math.log(10000), steps=half, device=device))
+    x_expanded = x.unsqueeze(-1) * freqs  # (B, T, half)
+    sin = torch.sin(x_expanded)
+    cos = torch.cos(x_expanded)
+    emb = torch.cat([sin, cos], dim=-1)
+    if emb.size(-1) < d_model:
+        pad = torch.zeros(x.shape[0], x.shape[1], d_model - emb.size(-1), device=device)
+        emb = torch.cat([emb, pad], dim=-1)
+    return emb
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-
-# -----------------------------
-# Encoder
-# -----------------------------
-class SpectrumEncoder(nn.Module):
-    def __init__(self, input_dim=2000, embed_dim=512, n_layers=6, n_heads=8, ff_dim=2048):
-        super().__init__()
-        self.input_proj = nn.Linear(input_dim, embed_dim)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=n_heads, dim_feedforward=ff_dim,
-            dropout=0.1, batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
-    def forward(self, x):
-        # x: (batch, input_dim)
-        x = self.input_proj(x).unsqueeze(1)   # (batch, seq=1, embed_dim)
-        x = self.encoder(x)                   # (batch, seq, embed_dim)
-        return x.squeeze(1)                   # (batch, embed_dim)
-
-
-# -----------------------------
-# Decoder
-# -----------------------------
-class FormulaDecoder(nn.Module):
-    def __init__(self, vocab_size, embed_dim=512, n_layers=6, n_heads=8, ff_dim=2048):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=embed_dim, nhead=n_heads, dim_feedforward=ff_dim,
-            dropout=0.1, batch_first=True
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
-        self.fc_out = nn.Linear(embed_dim, vocab_size)
-
-    def forward(self, tgt, memory):
-        # tgt: (batch, seq_len), memory: (batch, embed_dim)
-        tgt_emb = self.embedding(tgt)                    # (batch, seq_len, embed_dim)
-        out = self.decoder(tgt_emb, memory.unsqueeze(1)) # memory: (batch, 1, embed_dim)
-        return self.fc_out(out)                          # (batch, seq_len, vocab_size)
-
-
-# -----------------------------
-# Formula Transformer Head (energy-based scoring)
-# -----------------------------
-class FormulaTransformerHead(nn.Module):
+class AttentivePool(nn.Module):
     """
-    Scores candidate formulas against the spectrum embedding.
-
-    Inputs:
-      - spectrum_memory: (B, D) from encoder
-      - candidate_counts: (B, K, E) element counts per candidate (recommend log1p scale)
-      - adduct_idx: optional (B, K) indices for adduct embedding
-
-    Output:
-      - energies: (B, K) higher = better match
+    Learned attention pooling over sequence of peaks.
+    Produces a single spectrum embedding by attending over peaks.
     """
-    def __init__(self, num_elements=6, d_model=512, formula_emb_dim=512,
-                 use_adducts=False, num_adducts=0):
+    def __init__(self, d_model):
         super().__init__()
-        self.num_elements = num_elements
-        self.use_adducts = use_adducts
+        self.query = nn.Parameter(torch.randn(d_model))
 
-        self.formula_proj = nn.Sequential(
-            nn.LayerNorm(num_elements),
-            nn.Linear(num_elements, formula_emb_dim),
-            nn.GELU(),
-            nn.Linear(formula_emb_dim, d_model)
-        )
-
-        if use_adducts and num_adducts > 0:
-            self.adduct_emb = nn.Embedding(num_adducts, d_model)
-        else:
-            self.adduct_emb = None
-
-        # scoring over [spec_emb || formula_emb || interaction]
-        self.scorer = nn.Sequential(
-            nn.LayerNorm(3 * d_model),
-            nn.Linear(3 * d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, 1)
-        )
-
-    def forward(self, spectrum_memory, candidate_counts, adduct_idx=None):
-        B, K, E = candidate_counts.size()
-        spec = spectrum_memory                         # (B, D)
-        form_emb = self.formula_proj(candidate_counts) # (B, K, D)
-
-        if self.adduct_emb is not None and adduct_idx is not None:
-            add_emb = self.adduct_emb(adduct_idx)      # (B, K, D)
-            form_emb = form_emb + add_emb
-
-        spec_expanded = spec.unsqueeze(1).expand(B, K, spec.size(-1))   # (B, K, D)
-        interaction = spec_expanded * form_emb                          # (B, K, D)
-        concat = torch.cat([spec_expanded, form_emb, interaction], dim=-1)  # (B, K, 3D)
-
-        energy = self.scorer(concat).squeeze(-1)  # (B, K)
-        return energy
-
-
-# -----------------------------
-# Full Model with Auxiliary Heads and Formula Scoring
-# -----------------------------
-class Spectrum2Formula(nn.Module):
-    def __init__(self, input_dim, vocab_size, embed_dim=512,
-                 n_layers=6, n_heads=8, ff_dim=2048,
-                 num_elements=6, use_presence_head=True, hint_tokens=5,
-                 use_formula_transformer=True, formula_emb_dim=512,
-                 use_adducts=False, num_adducts=0):
+    def forward(self, x, mask=None):
         """
-        num_elements: number of element types (e.g., C,H,N,O,S,P)
-        use_presence_head: add a binary presence head for curriculum
-        hint_tokens: number of early decoder tokens to average for decoder hint
-        use_formula_transformer: enable energy-based formula scoring head
+        Args:
+            x: (B, T, D) sequence of peak embeddings
+            mask: (B, T) boolean mask, True for valid peaks
+        Returns:
+            (B, D) pooled embedding
         """
+        scores = torch.einsum("btd,d->bt", x, self.query)  # (B, T)
+        if mask is not None:
+            scores = scores.masked_fill(~mask, -1e9)
+        attn = torch.softmax(scores, dim=1)  # (B, T)
+        pooled = torch.einsum("btd,bt->bd", x, attn)  # (B, D)
+        return pooled
+
+import torch
+import torch.nn as nn
+# from embeddings import sinusoidal_embed
+# from pooling import AttentivePool
+
+class MassSpectrumEncoder(nn.Module):
+    """
+    Transformer-based encoder over peak sequences to element count classification,
+    with presence gating and m/z-informed embeddings.
+    """
+    def __init__(self,
+                 d_model=256,
+                 nhead=4,
+                 num_layers=4,
+                 dim_feedforward=1024,
+                 max_peaks=500,
+                 element_max_counts={'C': 50, 'H': 100, 'N': 20, 'O': 30, 'S': 10},
+                 use_presence_head=True,
+                 use_presence_gating=True,
+                 dropout=0.1):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.num_elements = num_elements
+        self.d_model = d_model
+        self.max_peaks = max_peaks
+        self.element_max_counts = element_max_counts
         self.use_presence_head = use_presence_head
-        self.hint_tokens = hint_tokens
-        self.use_formula_transformer = use_formula_transformer
+        self.use_presence_gating = use_presence_gating
 
-        # Encoder & Decoder
-        self.encoder = SpectrumEncoder(input_dim=input_dim, embed_dim=embed_dim,
-                                       n_layers=n_layers, n_heads=n_heads, ff_dim=ff_dim)
-        self.decoder = FormulaDecoder(vocab_size, embed_dim=embed_dim,
-                                      n_layers=n_layers, n_heads=n_heads, ff_dim=ff_dim)
-
-        # Gated fusion between encoder memory and a projected decoder hint
-        self.hint_proj = nn.Linear(embed_dim, embed_dim)
-        self.gate = nn.Sequential(
-            nn.Linear(2 * embed_dim, embed_dim),
+        # Intensity projection
+        self.intensity_proj = nn.Sequential(
+            nn.Linear(2, d_model // 2),
             nn.GELU(),
-            nn.Linear(embed_dim, 1),
-            nn.Sigmoid()
+            nn.Linear(d_model // 2, d_model // 2),
+        )
+        # m/z projection
+        self.mz_proj = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, d_model // 2),
         )
 
-        # Element counts head (predict log1p(counts))
-        self.elem_head = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, embed_dim),
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True, activation="gelu"
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Attention pooling
+        self.pool = AttentivePool(d_model)
+
+        # Shared mixing
+        self.shared_mlp = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
             nn.GELU(),
-            nn.Linear(embed_dim, num_elements)
+            nn.Dropout(dropout)
         )
 
-        # Optional presence head (binary logits)
+        # Element heads
+        self.element_heads = nn.ModuleDict()
+        for element, max_count in element_max_counts.items():
+            self.element_heads[element] = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model // 2, max_count + 1)
+            )
+
+        # Presence head
         if self.use_presence_head:
             self.presence_head = nn.Sequential(
-                nn.LayerNorm(embed_dim),
-                nn.Linear(embed_dim, embed_dim // 2),
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_model // 2),
                 nn.GELU(),
-                nn.Linear(embed_dim // 2, num_elements)
+                nn.Dropout(dropout),
+                nn.Linear(d_model // 2, len(element_max_counts))
             )
         else:
             self.presence_head = None
 
-        # Precursor mass regression
-        self.mass_head = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, embed_dim // 2),
-            nn.GELU(),
-            nn.Linear(embed_dim // 2, 1)
-        )
+    def forward(self, mz_values, intensities, mask=None):
+        B, T = mz_values.shape
+        device = mz_values.device
 
-        # Formula Transformer Head (energy-based scoring)
-        if self.use_formula_transformer:
-            self.formula_head = FormulaTransformerHead(
-                num_elements=num_elements, d_model=embed_dim, formula_emb_dim=formula_emb_dim,
-                use_adducts=use_adducts, num_adducts=num_adducts
-            )
+        # Intensity features
+        log_int = torch.log1p(intensities.clamp(min=0))
+        clip_int = intensities.clamp(min=0, max=1.0)
+        int_feat = torch.stack([log_int, clip_int], dim=-1)
+        int_emb = self.intensity_proj(int_feat)
+
+        # m/z sinusoidal embedding
+        mz_emb_raw = sinusoidal_embed(mz_values, self.d_model)
+        mz_emb = self.mz_proj(mz_emb_raw)
+
+        # Peak token embedding
+        x = torch.cat([mz_emb, int_emb], dim=-1)
+
+        # Transformer encoding
+        pad_mask = None
+        if mask is not None:
+            pad_mask = ~mask
+        x = self.transformer(x, src_key_padding_mask=pad_mask)
+
+        # Attention pooling
+        pooled = self.pool(x, mask=mask)
+
+        # Shared mixing
+        shared = self.shared_mlp(pooled)
+
+        # Presence head
+        if self.use_presence_head:
+            presence_logits = self.presence_head(shared)
+            presence_prob = torch.sigmoid(presence_logits)
         else:
-            self.formula_head = None
+            presence_logits = None
+            presence_prob = None
 
-    def forward(self, spectrum, tgt):
-        """
-        Returns:
-            logits: (batch, seq_len, vocab_size)
-            elem_logits: (batch, num_elements)  -> interpret as log1p(counts)
-            mass_pred: (batch, 1)
-            presence_logits (optional): (batch, num_elements) -> raw logits
-        """
-        # Encoder memory from spectrum
-        memory = self.encoder(spectrum)  # (batch, embed_dim)
-
-        # Decode tokens (for CE)
-        logits = self.decoder(tgt, memory)  # (batch, seq_len, vocab_size)
-
-        # Build a decoder hint from early tokens (teacher-forced)
-        k = min(self.hint_tokens, tgt.size(1))
-        dec_hint = self.decoder.embedding(tgt[:, :k]).mean(dim=1)  # (batch, embed_dim)
-        dec_hint_proj = self.hint_proj(dec_hint)
-
-        # Gate decides how much to trust memory vs decoder hint
-        gate_in = torch.cat([memory, dec_hint_proj], dim=-1)  # (batch, 2*embed_dim)
-        alpha = self.gate(gate_in)                            # (batch, 1), in [0,1]
-        fused = alpha * memory + (1 - alpha) * dec_hint_proj  # (batch, embed_dim)
-
-        # Element head predicts log1p(counts)
-        elem_logits = self.elem_head(fused)  # (batch, num_elements)
-
-        # Mass regression from memory
-        mass_pred = self.mass_head(memory)   # (batch, 1)
+        # Element predictions
+        predictions = {}
+        for i, (element, head) in enumerate(self.element_heads.items()):
+            logits = head(shared)
+            if self.use_presence_head and self.use_presence_gating:
+                nz_mask = torch.ones(logits.size(-1), device=device)
+                nz_mask[0] = 0.0
+                bias = (1.0 - presence_prob[:, i]).unsqueeze(-1) * nz_mask
+                logits = logits - 5.0 * bias
+            predictions[element] = logits
 
         if self.use_presence_head:
-            presence_logits = self.presence_head(fused)  # (batch, num_elements)
-            return logits, elem_logits, mass_pred, presence_logits
-
-        return logits, elem_logits, mass_pred
-
-    # Expose parts for beam search (backward compatible with your decoder)
-    def encoder_forward(self, spectrum):
-        return self.encoder(spectrum)  # (batch, embed_dim)
-
-    def decoder_forward(self, tgt, memory):
-        return self.decoder(tgt, memory)  # (batch, seq_len, vocab_size)
-
-    # Formula scoring head: energy-based ranking of candidate formulas
-    @torch.no_grad()
-    def score_formulas(self, spectrum, candidate_counts, adduct_idx=None):
-        """
-        spectrum: (B, input_dim)
-        candidate_counts: (B, K, num_elements), recommend log1p(counts)
-        adduct_idx: optional (B, K) long tensor indices
-        Returns: energies (B, K) higher = better
-        """
-        memory = self.encoder(spectrum)  # (B, D)
-        if self.formula_head is None:
-            raise RuntimeError("FormulaTransformerHead not initialized; set use_formula_transformer=True.")
-        return self.formula_head(memory, candidate_counts, adduct_idx)
+            return predictions, presence_logits
+        return predictions

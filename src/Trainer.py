@@ -1,159 +1,126 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from src.FormulaUtils import FormulaUtils
 
 
-class Trainer:
-    def __init__(self, model, optimizer, criterion, device, scaler,
-                 lambda_elem_start=0.1, lambda_elem_max=0.5, lambda_mass=1e-4,
-                 use_presence=True, ramp_epochs=10,
-                 lambda_consistency=0.01, lambda_seq_mass=1e-4,
-                 lambda_formula_rank=1e-3):
-        """
-        Trainer for Spectrum2Formula model.
+def expected_counts_from_logits(logits):
+    counts_exp = {}
+    for elem, lg in logits.items():
+        probs = torch.softmax(lg, dim=-1)
+        classes = torch.arange(lg.size(-1), device=lg.device).float()
+        exp = (probs * classes.unsqueeze(0)).sum(dim=-1)
+        counts_exp[elem] = exp
+    return counts_exp
 
-        Args:
-            model: Spectrum2FormulaHybrid
-            optimizer: torch optimizer
-            criterion: CE loss for sequence tokens
-            device: torch.device
-            scaler: GradScaler for mixed precision
-            lambda_elem_start: starting weight for element loss
-            lambda_elem_max: max weight for element loss
-            lambda_mass: weight for auxiliary mass regression loss
-            use_presence: whether to use presence head
-            ramp_epochs: epochs to ramp element loss weight
-            lambda_consistency: weight for consistency loss
-            lambda_seq_mass: weight for sequence-level mass penalty
-            lambda_formula_rank: weight for formula transformer ranking loss
-        """
+
+def batch_mass_from_expected_counts(counts_exp):
+    device = next(iter(counts_exp.values())).device
+    B = next(iter(counts_exp.values())).shape[0]
+    mass = torch.zeros(B, device=device)
+    for elem, exp in counts_exp.items():
+        mass = mass + exp * FormulaUtils.ATOMIC_MASS.get(elem, 0.0)
+    return mass
+
+
+class SpectrumTrainer:
+    """
+    Trainer for MassSpectrumEncoder with:
+      - per-element weighted CE loss
+      - optional presence head loss
+      - stronger relative mass penalty
+    """
+
+    def __init__(self, model, optimizer, device,
+                 element_order,
+                 class_weights=None,
+                 lambda_presence=0.1,
+                 lambda_entropy=0.01,
+                 lambda_mass=0.5,   # stronger default
+                 grad_clip=1.0):
         self.model = model
         self.optimizer = optimizer
-        self.criterion = criterion
         self.device = device
-        self.scaler = scaler
-
-        # Loss weights
-        self.lambda_elem_start = lambda_elem_start
-        self.lambda_elem_max = lambda_elem_max
+        self.element_order = element_order
+        # Default: emphasize C and H
+        self.class_weights = class_weights or {"C": 2.0, "H": 2.0}
+        self.lambda_presence = lambda_presence
+        self.lambda_entropy = lambda_entropy
         self.lambda_mass = lambda_mass
-        self.use_presence = use_presence
-        self.ramp_epochs = ramp_epochs
-        self.lambda_consistency = lambda_consistency
-        self.lambda_seq_mass = lambda_seq_mass
-        self.lambda_formula_rank = lambda_formula_rank
+        self.grad_clip = grad_clip
 
-        if self.use_presence:
-            self.presence_loss_fn = nn.BCEWithLogitsLoss()
+    def set_class_weights(self, weights: dict):
+        self.class_weights = weights
 
-    def _counts_from_tokens(self, tokens, tokenizer, element_order):
-        decoded = tokenizer.decode(tokens.tolist())
-        fdict = FormulaUtils.parse_formula_dict(decoded)
-        return torch.tensor([fdict.get(e, 0) for e in element_order], dtype=torch.float32)
-
-    def train_step(self, batch, elem_targets_all, mass_targets_all, batch_indices,
-                   epoch=0, tokenizer=None, element_order=None,
-                   candidate_sampler=None):
-        """
-        candidate_sampler: function that given a batch index returns a set of negative formulas
-                           (as element count vectors). Should return tensor (K-1, num_elements).
-        """
+    def train_step(self, batch, mass_targets=None):
         self.model.train()
-        self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer.zero_grad()
 
-        spectrum, tokens = batch
-        spectrum, tokens = spectrum.to(self.device), tokens.to(self.device)
-        tgt_in, tgt_out = tokens[:, :-1], tokens[:, 1:]
+        mz, intens, mask, counts = batch
+        mz, intens, mask, counts = mz.to(self.device), intens.to(self.device), mask.to(self.device), counts.to(self.device)
 
-        # Targets
-        elem_tgt = elem_targets_all[batch_indices].to(self.device)
-        elem_tgt = torch.log1p(elem_tgt)
-        mass_tgt = mass_targets_all[batch_indices].to(self.device) / 1000.0
+        outputs = self.model(mz, intens, mask)
+        if isinstance(outputs, tuple):
+            predictions, presence_logits = outputs
+            presence_tgt = (counts > 0).float()
+            bce = F.binary_cross_entropy_with_logits(presence_logits, presence_tgt)
+            p = torch.sigmoid(presence_logits).clamp(1e-6, 1 - 1e-6)
+            entropy = -(p * torch.log(p) + (1 - p) * torch.log(1 - p)).mean()
+            presence_loss = self.lambda_presence * bce + self.lambda_entropy * entropy
+        else:
+            predictions = outputs
+            presence_loss = torch.tensor(0.0, device=self.device)
 
-        with torch.amp.autocast("cuda"):
-            outputs = self.model(spectrum, tgt_in)
-            if self.use_presence:
-                logits, elem_logits, mass_pred, presence_logits = outputs
+        # Weighted element classification loss
+        ce_total = 0.0
+        for e_idx, e in enumerate(self.element_order):
+            logits = predictions[e]
+            targets = counts[:, e_idx]
+            if e in self.class_weights:
+                ce = F.cross_entropy(logits, targets) * self.class_weights[e]
             else:
-                logits, elem_logits, mass_pred = outputs
-                presence_logits = None
+                ce = F.cross_entropy(logits, targets)
+            ce_total = ce_total + ce
 
-            # --- Losses ---
-            ce_loss = self.criterion(logits.reshape(-1, logits.size(-1)),
-                                     tgt_out.reshape(-1))
-            elem_loss = F.smooth_l1_loss(elem_logits, elem_tgt)
-            mass_loss = F.mse_loss(mass_pred.squeeze(-1), mass_tgt)
+        # Relative mass penalty
+        if mass_targets is not None:
+            counts_exp = expected_counts_from_logits(predictions)
+            pred_mass = batch_mass_from_expected_counts(counts_exp)
+            mass_tgt = mass_targets.to(self.device)
+            rel_err = torch.abs(pred_mass - mass_tgt) / (mass_tgt + 1e-6)
+            mass_penalty = rel_err.mean()
+        else:
+            mass_penalty = torch.tensor(0.0, device=self.device)
 
-            if self.use_presence:
-                presence_tgt = (elem_tgt > 0).float()
-                pres_loss = self.presence_loss_fn(presence_logits, presence_tgt)
-            else:
-                pres_loss = torch.tensor(0.0, device=self.device)
+        loss = ce_total + presence_loss + self.lambda_mass * mass_penalty
+        loss.backward()
+        if self.grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+        self.optimizer.step()
 
-            # Consistency + sequence-level mass loss
-            if tokenizer is not None and element_order is not None:
-                counts_seq, seq_masses = [], []
-                for i in range(tokens.size(0)):
-                    decoded = tokenizer.decode(tokens[i].tolist())
-                    fdict = FormulaUtils.parse_formula_dict(decoded)
-                    counts_seq.append(torch.tensor([fdict.get(e, 0) for e in element_order],
-                                                   dtype=torch.float32))
-                    seq_masses.append(FormulaUtils.compute_mass(fdict) / 1000.0)
-                counts_seq = torch.stack(counts_seq).to(self.device)
-                counts_seq = torch.log1p(counts_seq)
-                consistency_loss = F.mse_loss(elem_logits, counts_seq)
+        return {
+            "elem_ce": ce_total.item(),
+            "presence": presence_loss.item() if torch.is_tensor(presence_loss) else 0.0,
+            "mass_penalty": mass_penalty.item(),
+            "total": loss.item()
+        }
 
-                seq_masses = torch.tensor(seq_masses, device=self.device, dtype=torch.float32)
-                seq_mass_loss = F.mse_loss(seq_masses, mass_tgt)
-            else:
-                consistency_loss = torch.tensor(0.0, device=self.device)
-                seq_mass_loss = torch.tensor(0.0, device=self.device)
+    def validate(self, val_loader):
+        self.model.eval()
+        elem_correct = {e: 0 for e in self.element_order}
+        elem_total = {e: 0 for e in self.element_order}
 
-            # --- Formula ranking loss (InfoNCE style) ---
-            if self.model.use_formula_transformer and candidate_sampler is not None:
-                B = spectrum.size(0)
-                num_elements = elem_tgt.size(1)
-                candidate_sets = []
-                labels = []
-                for i in range(B):
-                    true_counts = elem_targets_all[batch_indices[i]].cpu()
-                    negatives = candidate_sampler(batch_indices[i])  # (K-1, E)
-                    candidates = torch.cat([true_counts.unsqueeze(0), negatives], dim=0)  # (K, E)
-                    candidate_sets.append(candidates)
-                    labels.append(0)  # true formula is at index 0
-                candidate_counts = torch.stack(candidate_sets).to(self.device).float()
-                labels = torch.tensor(labels, device=self.device, dtype=torch.long)
+        with torch.no_grad():
+            for mz, intens, mask, counts in val_loader:
+                mz, intens, mask, counts = mz.to(self.device), intens.to(self.device), mask.to(self.device), counts.to(self.device)
+                outputs = self.model(mz, intens, mask)
+                predictions = outputs[0] if isinstance(outputs, tuple) else outputs
 
-                energies = self.model.formula_head(self.model.encoder(spectrum),
-                                                   torch.log1p(candidate_counts))
-                rank_loss = F.cross_entropy(energies, labels)
-            else:
-                rank_loss = torch.tensor(0.0, device=self.device)
+                for e_idx, e in enumerate(self.element_order):
+                    logits = predictions[e]
+                    pred_class = logits.argmax(dim=-1)
+                    true_class = counts[:, e_idx]
+                    elem_correct[e] += (pred_class == true_class).sum().item()
+                    elem_total[e] += true_class.numel()
 
-            # Ramp lambda_elem
-            lambda_elem = min(self.lambda_elem_max,
-                              self.lambda_elem_start + (epoch / self.ramp_epochs) *
-                              (self.lambda_elem_max - self.lambda_elem_start))
-
-            # Final loss
-            loss = (ce_loss +
-                    lambda_elem * elem_loss +
-                    self.lambda_mass * mass_loss +
-                    self.lambda_consistency * consistency_loss +
-                    self.lambda_seq_mass * seq_mass_loss +
-                    self.lambda_formula_rank * rank_loss +
-                    (0.1 * pres_loss if self.use_presence else 0.0))
-
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-
-        return (ce_loss.item(),
-                elem_loss.item(),
-                mass_loss.item(),
-                pres_loss.item() if self.use_presence else 0.0,
-                consistency_loss.item(),
-                seq_mass_loss.item(),
-                rank_loss.item(),
-                loss.item())
+        accs = {e: elem_correct[e] / max(1, elem_total[e]) for e in self.element_order}
+        return accs
