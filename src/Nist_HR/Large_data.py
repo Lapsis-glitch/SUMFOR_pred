@@ -6,15 +6,17 @@ from formula import Formula
 from peak_driven_enumerator import PeakDrivenEnumerator
 from peak_driven_assignment_engine import PeakDrivenAssignmentEngine
 from utils import convert_assignments
+from hybrid_enumerator import HybridEnumerator
+from rdkit import Chem
 
 # ML correction
 from ml_correction_integration import apply_ml_correction
 
 MIN_REL_INTENSITY = 0.05
-MERGED_PATH = "/mnt/d/Leco/merged_clean.json"
+MERGED_PATH = "/mnt/d/Leco/merged_clean_SIP.json"
 
 # Allowed elements
-ALLOWED_ELEMENTS = {"C", "H", "O", "N", "Cl", "Br", "F"}
+ALLOWED_ELEMENTS = {"C", "H", "O", "N", "Cl", "Br", "F", "I", "S", "P"}
 
 
 def formula_has_only_allowed_elements(formula):
@@ -111,12 +113,60 @@ def run_single_entry(entry_id: str):
         "alkene_rules": True,
     }
 
-    peak_enum = PeakDrivenEnumerator(
-        parent_formula,
-        rule_flags=rule_flags,
-        max_depth=FRAG_DEPTH,
-        auto_detect_rules=True,
-    )
+    #OLD implementation with just rules
+    # peak_enum = PeakDrivenEnumerator(
+    #     parent_formula,
+    #     rule_flags=rule_flags,
+    #     max_depth=FRAG_DEPTH,
+    #     auto_detect_rules=True,
+    # )
+
+    #New hybrid implementation that merges rules + BDE-based fragments
+    # -----------------------------
+    # Hybrid or fallback enumerator
+    # -----------------------------
+    pubchem = entry.get("pubchem")
+    bde_data = entry.get("bde_data") or entry.get("bde")  # support both names
+
+    use_hybrid = False
+    mol = None
+
+    # Try to build RDKit mol if possible
+    if pubchem:
+        smiles = pubchem.get("canonical_smiles") or pubchem.get("isomeric_smiles")
+        inchi = pubchem.get("inchi")
+
+        if smiles:
+            mol = Chem.MolFromSmiles(smiles)
+        elif inchi:
+            mol = Chem.MolFromInchi(inchi)
+
+        if mol is not None:
+            mol = Chem.AddHs(mol)
+
+    # Decide whether hybrid is possible
+    if mol is not None and bde_data:
+        use_hybrid = True
+
+    # Choose enumerator
+    if use_hybrid:
+        peak_enum = HybridEnumerator(
+            parent_formula,
+            mol,
+            bde_data,
+            rule_flags=rule_flags,
+            max_depth=FRAG_DEPTH,
+            bde_threshold=100.0,
+            bde_softness=25.0,
+        )
+    else:
+        # Fallback: rule-based only
+        peak_enum = PeakDrivenEnumerator(
+            parent_formula,
+            rule_flags=rule_flags,
+            max_depth=FRAG_DEPTH,
+            auto_detect_rules=True,
+        )
 
     engine = PeakDrivenAssignmentEngine(parent_formula, peak_enum)
 

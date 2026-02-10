@@ -16,7 +16,7 @@ from typing import List, Dict
 from formula import Formula
 from fragment import Fragment
 from chemistry import exact_mass, dbe
-from fragmentation_rules import generate_rule_based_fragments
+from fragmentation_rules_info import generate_rule_based_fragments
 from utils import nist_bin
 
 

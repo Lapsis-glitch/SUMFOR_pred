@@ -11,17 +11,19 @@ from formula import Formula
 from chemistry import exact_mass, dbe
 from chemical_classification import classify_molecule
 
-MODEL_OUT = "ml_correction_model.txt"
-FEATURES_IMPORTANCE = "ml_feature_importance.json"
+MODEL_OUT = "ml_correction_model_SIP.txt"
+FEATURES_IMPORTANCE = "ml_feature_importance_SIP.json"
 
 
 # ------------------------------------------------------------
 # Load model + feature names
 # ------------------------------------------------------------
 class MLCorrectionModel:
-    def __init__(self,
-                 model_path: str = MODEL_OUT,
-                 importance_path: str = FEATURES_IMPORTANCE):
+    def __init__(
+        self,
+        model_path: str = MODEL_OUT,
+        importance_path: str = FEATURES_IMPORTANCE,
+    ):
         self.booster = lgb.Booster(model_file=model_path)
 
         # feature names from importance file (keys)
@@ -99,6 +101,14 @@ class MLCorrectionModel:
                     return 1
         return 0
 
+    @staticmethod
+    def detect_i_pattern(mz, intensities):
+        # Iodine has a single major isotope at 127
+        for m, i in zip(mz, intensities):
+            if abs(m - 127.0) <= 0.3 and i > 0:
+                return 1
+        return 0
+
     # --------------------------------------------------------
     # Local peak context
     # --------------------------------------------------------
@@ -148,14 +158,29 @@ class MLCorrectionModel:
         parent_mass = exact_mass(parent_formula)
         parent_dbe = dbe(parent_formula)
         elems = parent_formula.elements
+
         n_C = elems.get("C", 0)
         n_H = elems.get("H", 0)
         n_O = elems.get("O", 0)
         n_N = elems.get("N", 0)
-        n_halogen = sum(elems.get(x, 0) for x in ["Cl", "Br", "F", "I"])
+        n_S = elems.get("S", 0)
+        n_P = elems.get("P", 0)
+
+        n_F  = elems.get("F", 0)
+        n_Cl = elems.get("Cl", 0)
+        n_Br = elems.get("Br", 0)
+        n_I  = elems.get("I", 0)
+
+        n_halogen = n_F + n_Cl + n_Br + n_I
 
         # classes
-        classes_set = classify_molecule(parent_name, parent_formula_str)
+        classes_set = set(classify_molecule(parent_name, parent_formula_str))
+        if n_S > 0: classes_set.add("sulfur")
+        if n_P > 0: classes_set.add("phosphorus")
+        if n_F > 0: classes_set.add("fluorinated")
+        if n_Cl > 0: classes_set.add("chlorinated")
+        if n_Br > 0: classes_set.add("brominated")
+        if n_I > 0: classes_set.add("iodinated")
 
         # NIST global descriptors
         nist_n_peaks = len(nist_mz)
@@ -175,6 +200,7 @@ class MLCorrectionModel:
 
         cl_pat = self.detect_cl_pattern(nist_mz, nist_int)
         br_pat = self.detect_br_pattern(nist_mz, nist_int)
+        i_pat  = self.detect_i_pattern(nist_mz, nist_int)
 
         # relative intensities
         max_int = max(nist_int)
@@ -197,13 +223,27 @@ class MLCorrectionModel:
         except Exception:
             frag_dbe = 0.0
 
+        frag_elems = frag_formula.elements
+        frag_n_C = frag_elems.get("C", 0)
+        frag_n_H = frag_elems.get("H", 0)
+        frag_n_O = frag_elems.get("O", 0)
+        frag_n_N = frag_elems.get("N", 0)
+        frag_n_S = frag_elems.get("S", 0)
+        frag_n_P = frag_elems.get("P", 0)
+        frag_n_F  = frag_elems.get("F", 0)
+        frag_n_Cl = frag_elems.get("Cl", 0)
+        frag_n_Br = frag_elems.get("Br", 0)
+        frag_n_I  = frag_elems.get("I", 0)
+        frag_n_halogen = frag_n_F + frag_n_Cl + frag_n_Br + frag_n_I
+
         mass_fraction = frag_mass / parent_mass if parent_mass > 0 else 0.0
 
         rule_source = assignment.rule_source or ""
-        if " (depth=" in rule_source:
-            rule_family = rule_source.split(" (depth=")[0]
+        # normalize rule_family like in training: take prefix before first "_"
+        if rule_source:
+            rule_family = rule_source.split("_")[0]
         else:
-            rule_family = rule_source or "none"
+            rule_family = "none"
 
         peak_nominal_mz = assignment.nominal_mz
         peak_intensity = assignment.intensity
@@ -225,6 +265,12 @@ class MLCorrectionModel:
             "n_H": n_H,
             "n_O": n_O,
             "n_N": n_N,
+            "n_S": n_S,
+            "n_P": n_P,
+            "n_F": n_F,
+            "n_Cl": n_Cl,
+            "n_Br": n_Br,
+            "n_I": n_I,
             "n_halogen": n_halogen,
 
             "nist_n_peaks": nist_n_peaks,
@@ -241,6 +287,7 @@ class MLCorrectionModel:
             "has_peak_105": aromatic_105,
             "has_cl_pattern": cl_pat,
             "has_br_pattern": br_pat,
+            "has_i_pattern": i_pat,
 
             "peak_nominal_mz": peak_nominal_mz,
             "peak_intensity": peak_intensity,
@@ -256,6 +303,19 @@ class MLCorrectionModel:
             "frag_dbe": frag_dbe,
             "mass_fraction": mass_fraction,
             "confidence": assignment.confidence,
+
+            "frag_n_C": frag_n_C,
+            "frag_n_H": frag_n_H,
+            "frag_n_O": frag_n_O,
+            "frag_n_N": frag_n_N,
+            "frag_n_S": frag_n_S,
+            "frag_n_P": frag_n_P,
+            "frag_n_F": frag_n_F,
+            "frag_n_Cl": frag_n_Cl,
+            "frag_n_Br": frag_n_Br,
+            "frag_n_I": frag_n_I,
+            "frag_n_halogen": frag_n_halogen,
+
             "rule_family": rule_family,
         }
 
@@ -291,6 +351,8 @@ class MLCorrectionModel:
         nist_int,
         assignment,
     ) -> float:
+
+        # Build feature row with full CHONXPSI + class_* + rule_family
         features = self.build_feature_row(
             parent_name=parent_name,
             parent_formula_str=parent_formula_str,
@@ -298,6 +360,11 @@ class MLCorrectionModel:
             nist_int=nist_int,
             assignment=assignment,
         )
-        # Booster.predict with pandas aligns by column name
-        prob = self.booster.predict(features)[0]
-        return float(prob)
+
+        # Ensure column order matches training
+        features = features[self.feature_names]
+
+        # LightGBM Booster.predict returns array-like
+        prob = float(self.booster.predict(features)[0])
+
+        return prob

@@ -49,6 +49,15 @@ NEUTRAL_LOSSES = [
 ]
 
 # ------------------------------------------------------------
+# Sulfur-specific neutral losses
+# ------------------------------------------------------------
+SULFUR_LOSSES = {
+    "H2S":  Formula({"H": 2, "S": 1}),     # thiols, thioethers
+    "SO2":  Formula({"S": 1, "O": 2}),     # sulfones, sulfonates, sulfonamides
+}
+
+
+# ------------------------------------------------------------
 # Common EI cations (ubiquitous across organic MS)
 # ------------------------------------------------------------
 COMMON_CATIONS = [
@@ -249,6 +258,9 @@ def detect_functional_groups(parent: Formula) -> Dict[str, bool]:
         "ether": False,
         "alkene": False,
         "halogen": False,
+        "sulfur": False,
+        "thiol_or_thioether": False,
+        "sulfonyl": False,
     }
 
     c = elems.get("C", 0)
@@ -257,8 +269,14 @@ def detect_functional_groups(parent: Formula) -> Dict[str, bool]:
     n = elems.get("N", 0)
     cl = elems.get("Cl", 0)
     br = elems.get("Br", 0)
+    s = elems.get("S", 0)
 
-    # Very simple heuristics; you likely already had something similar
+    fg["sulfur"] = s > 0
+    fg["thiol_or_thioether"] = (s > 0 and o == 0)
+    fg["sulfonyl"] = (s > 0 and o >= 2)
+
+
+    # Very simple heuristics;
     if o > 0 and h >= 2:
         fg["alcohol"] = True
 
@@ -526,5 +544,34 @@ def generate_rule_based_fragments(
         frag2 = _subtract(parent, Formula({"C": 1, "H": 2, "O": 1}))
         if frag2 is not None:
             results.append((frag2, "CH2O_loss"))
+
+        # --------------------------------------------------------
+        # Sulfur-specific rules
+        # --------------------------------------------------------
+    if fg.get("sulfur", False):
+
+        # --- Rule 1: C–S alpha cleavage ---
+        # We approximate alpha-cleavage by subtracting small alkyl radicals
+        # (same approach as your oxygen alpha rules)
+        for loss in ALPHA_CLEAVAGE_LOSSES:
+            frag = _subtract(parent, loss)
+            if frag is not None:
+                # Only keep fragments that still contain sulfur
+                if "S" in frag.elements:
+                    results.append((frag, "sulfur_alpha"))
+
+        # --- Rule 2: H2S loss (thiols, thioethers) ---
+        if fg.get("thiol_or_thioether", False):
+            loss = SULFUR_LOSSES["H2S"]
+            frag = _subtract(parent, loss)
+            if frag is not None:
+                results.append((frag, "sulfur_H2S_loss"))
+
+        # --- Rule 3: SO2 loss (sulfones, sulfonates, sulfonamides) ---
+        if fg.get("sulfonyl", False):
+            loss = SULFUR_LOSSES["SO2"]
+            frag = _subtract(parent, loss)
+            if frag is not None:
+                results.append((frag, "sulfur_SO2_loss"))
 
     return results

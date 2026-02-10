@@ -1,21 +1,14 @@
-"""
-clean_merged_dataset.py
-
-Creates a cleaned version of merged.json:
-- removes entries with unsupported elements
-- removes entries with missing spectra
-- removes entries with malformed formulas
-"""
+# clean_merged_dataset.py
 
 import json
 import re
 from formula import Formula
 
 MERGED_PATH = "/mnt/d/Leco/merged.json"
-OUT_PATH    = "/mnt/d/Leco/merged_clean.json"
+OUT_PATH    = "/mnt/d/Leco/merged_clean_SIP.json"
 
 # Allowed elements for your fragmentation engine
-ALLOWED_ELEMENTS = {"C", "H", "O", "N", "Cl", "Br", "F"}
+ALLOWED_ELEMENTS = {"C", "H", "O", "N", "Cl", "Br", "F", "I", "S", "P"}
 
 def formula_has_only_allowed_elements(formula):
     """Return False if formula contains unsupported elements."""
@@ -26,7 +19,6 @@ def formula_has_only_allowed_elements(formula):
 
 def formula_is_valid(formula_str):
     """Reject formulas with weird characters or isotopic labels."""
-    # Accepts C, H, O, N, F, Cl, Br, I, digits
     return bool(re.fullmatch(r"[A-Za-z0-9]+", formula_str))
 
 
@@ -49,11 +41,12 @@ def main():
             continue
 
         # Skip missing NIST matches
-        if not entry.get("nist_matches"):
+        nist_matches = entry.get("nist_matches")
+        if not nist_matches:
             removed += 1
             continue
 
-        nist = entry["nist_matches"][0]
+        nist = nist_matches[0]
         nist_mz = nist.get("mz", [])
         nist_int = nist.get("intensities", [])
 
@@ -79,13 +72,20 @@ def main():
             removed += 1
             continue
 
-        # Skip unsupported elements (Mo, Si, B, P, S, metals…)
+        # Skip unsupported elements
         if not formula_has_only_allowed_elements(parent_formula):
             removed += 1
             continue
 
+        # Extract InChIKeys safely
+        inchi_keys = [m.get("inchikey") for m in nist_matches if m.get("inchikey")]
+
         # Passed all checks → keep entry
-        cleaned[entry_id] = entry
+        cleaned[entry_id] = {
+            "csv_entry": csv_entry,
+            "nist_matches": nist_matches,
+            "inchi_keys": inchi_keys
+        }
 
     # Save cleaned dataset
     with open(OUT_PATH, "w") as f:

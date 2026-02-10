@@ -25,6 +25,14 @@ NAME_PATTERNS = {
 
     r"chloro|bromo|fluoro|iodo": "halogenated",
 
+    # --- sulfur-specific name patterns ---
+    r"thiol|mercapto": "thiol",
+    r"thioether|sulfide": "thioether",
+    r"sulfoxide": "sulfoxide",
+    r"sulfone": "sulfone",
+    r"sulfonate": "sulfonate",
+    r"sulfonamide": "sulfonamide",
+
     r"d[0-9]+$|13c|15n": "isotopically_labeled",
 }
 
@@ -58,6 +66,18 @@ def classify_from_formula(formula: Formula):
     if c >= 6 and rdbe >= 4:
         classes.add("aromatic")
 
+    # --- sulfur-specific formula hints ---
+    s = elems.get("S", 0)
+    o = elems.get("O", 0)
+
+    # Very rough heuristics
+    if s >= 1 and o == 0:
+        classes.add("reduced_sulfur")      # thiols, thioethers, sulfides
+    if s >= 1 and o == 1:
+        classes.add("sulfoxide_like")      # sulfoxides, sulfenates
+    if s >= 1 and o == 2:
+        classes.add("sulfonyl_like")       # sulfones, sulfonates, sulfonamides
+
     return classes
 
 # ------------------------------------------------------------
@@ -88,7 +108,6 @@ def classify_molecule(name: str, formula_str: str):
     classes |= classify_from_name(name)
     classes |= classify_from_formula(formula)
 
-    # fallback: if nothing detected
     if not classes:
         classes.add("unknown")
 

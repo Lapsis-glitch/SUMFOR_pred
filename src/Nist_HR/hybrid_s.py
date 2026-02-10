@@ -1,10 +1,20 @@
-# validate_hybrid_precision_extended.py
+# validate_hybrid_precision_S.py
 
 import numpy as np
 import matplotlib.pyplot as plt
-import csv
 import json
-from Large_data import ENTRY_IDS, run_single_entry
+import os
+
+# Load S-only dataset
+MERGED_PATH_S = "/mnt/d/Leco/merged_clean_S.json"
+
+with open(MERGED_PATH_S, "r") as f:
+    MERGED_S = json.load(f)
+
+ENTRY_IDS = sorted(MERGED_S.keys(), key=lambda x: int(x))
+
+# Import your runner
+from Large_data import run_single_entry
 
 TOL = 0.0001
 HYBRID_THR = 0.7
@@ -19,7 +29,7 @@ def is_correct(frag_mz, aml_mz_list, tol=TOL):
 # ------------------------------------------------------------
 # Export predicted fragments as a “fake HR spectrum”
 # ------------------------------------------------------------
-def export_fake_spectrum(entry_id, parent_name, parent_formula, assignments, out_dir="fake_spectra"):
+def export_fake_spectrum(entry_id, parent_name, parent_formula, assignments, out_dir="fake_spectra_S"):
     """
     Saves a JSON file containing:
         - predicted fragment m/z
@@ -46,8 +56,6 @@ def export_fake_spectrum(entry_id, parent_name, parent_formula, assignments, out
             "formula": a.get("best_formula")
         })
 
-    # Save JSON
-    import os
     os.makedirs(out_dir, exist_ok=True)
     path = f"{out_dir}/entry_{entry_id}.json"
 
@@ -63,8 +71,10 @@ def main():
     predicted_counts = []
     correct_counts = []
 
-    print("Running hybrid precision validation...")
+    print(f"Total S-containing entries: {len(ENTRY_IDS)}")
+    print("Running hybrid precision validation on S-only dataset...")
 
+    # You can adjust the slice if you want fewer entries
     for eid in ENTRY_IDS:
         result = run_single_entry(eid)
         if result is None:
@@ -88,7 +98,6 @@ def main():
             if is_correct(frag_mz, aml_mz):
                 correct += 1
 
-        # Skip spectra with zero predicted fragments
         if predicted == 0:
             continue
 
@@ -96,11 +105,10 @@ def main():
         correct_counts.append(correct)
         precisions.append(correct / predicted)
 
-        # Export fake HR spectrum
         export_fake_spectrum(
             entry_id=eid,
-            parent_name=result["entry_id"],
-            parent_formula=result["parent_formula"],
+            parent_name=parent_name,
+            parent_formula=parent_formula,
             assignments=assignments
         )
 
@@ -108,7 +116,7 @@ def main():
     pred_arr = np.array(predicted_counts)
     corr_arr = np.array(correct_counts)
 
-    print("\n=== Hybrid Precision Statistics (zero-prediction spectra discarded) ===")
+    print("\n=== Hybrid Precision Statistics (S-only, zero-prediction spectra discarded) ===")
     print(f"Spectra evaluated: {len(arr)}")
 
     print("\n--- Precision (correct / predicted) ---")
@@ -129,7 +137,7 @@ def main():
     # ------------------------------------------------------------
     plt.figure(figsize=(8, 5))
     plt.hist(arr, bins=15, color="steelblue", edgecolor="black", alpha=0.8)
-    plt.title("Hybrid Precision Distribution Across Spectra")
+    plt.title("Hybrid Precision Distribution (S-only)")
     plt.xlabel("Precision (correct / predicted)")
     plt.ylabel("Number of spectra")
     plt.grid(alpha=0.3)
@@ -141,7 +149,7 @@ def main():
     # ------------------------------------------------------------
     plt.figure(figsize=(8, 5))
     plt.hist(pred_arr, bins=15, color="darkorange", edgecolor="black", alpha=0.8)
-    plt.title("Distribution of Predicted Fragments per Spectrum")
+    plt.title("Predicted Fragment Count Distribution (S-only)")
     plt.xlabel("Number of predicted fragments")
     plt.ylabel("Number of spectra")
     plt.grid(alpha=0.3)

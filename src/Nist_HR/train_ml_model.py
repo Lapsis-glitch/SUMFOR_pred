@@ -12,9 +12,9 @@ from sklearn.metrics import (
     f1_score,
 )
 
-TRAIN_CSV = "training_fragments.csv"
-MODEL_OUT = "ml_correction_model.txt"
-FEATURES_OUT = "ml_feature_importance.json"
+TRAIN_CSV = "training_fragments_SIP.csv"
+MODEL_OUT = "ml_correction_model_SIP.txt"
+FEATURES_OUT = "ml_feature_importance_SIP.json"
 
 
 # ------------------------------------------------------------
@@ -38,10 +38,8 @@ print(f"Total unique entries: {len(unique_ids)}")
 
 
 # ------------------------------------------------------------
-# Feature engineering
-# ------------------------------------------------------------
-
 # Multi-class string → multi-hot encoding
+# ------------------------------------------------------------
 def expand_classes(series):
     all_classes = set()
     for s in series:
@@ -57,12 +55,14 @@ def expand_classes(series):
                 out.at[idx, f"class_{c}"] = 1
     return out
 
+
 # Expand class labels and append to df
 class_features = expand_classes(df["classes"])
 df = pd.concat([df, class_features], axis=1)
 
 # Categorical: rule_family
 df["rule_family"] = df["rule_family"].fillna("none").astype("category")
+
 
 # Re-split after adding features / dtypes
 train_df = df[df["entry_id"].isin(train_ids)]
@@ -73,29 +73,56 @@ print(f"Validation fragments: {len(val_df)}")
 
 
 # ------------------------------------------------------------
-# Select features
+# Feature selection
 # ------------------------------------------------------------
 feature_cols = [
 
-    # parent
-    "parent_mass", "parent_dbe", "n_C", "n_H", "n_O", "n_N", "n_halogen",
+    # parent-level descriptors
+    "parent_mass", "parent_dbe",
+    "n_C", "n_H", "n_O", "n_N",
+    "n_S", "n_P",
+    "n_F", "n_Cl", "n_Br", "n_I",
+    "n_halogen",
 
-    # NIST global
-    "nist_n_peaks", "nist_base_mz", "nist_base_intensity",
-    "nist_entropy", "nist_peak_density",
-    "nist_intensity_mean", "nist_intensity_std",
-    "nist_highmass_fraction", "nist_lowmass_fraction",
-    "has_peak_77", "has_peak_91", "has_peak_105",
-    "has_cl_pattern", "has_br_pattern",
+    # NIST global descriptors
+    "nist_n_peaks",
+    "nist_base_mz",
+    "nist_base_intensity",
+    "nist_entropy",
+    "nist_peak_density",
+    "nist_intensity_mean",
+    "nist_intensity_std",
+    "nist_highmass_fraction",
+    "nist_lowmass_fraction",
+    "has_peak_77",
+    "has_peak_91",
+    "has_peak_105",
+    "has_cl_pattern",
+    "has_br_pattern",
+    "has_i_pattern",
 
-    # peak-level
-    "peak_nominal_mz", "peak_intensity", "peak_rel_intensity",
-    "local_intensity_mz", "local_intensity_mz_minus1",
-    "local_intensity_mz_plus1", "local_intensity_mz_minus14",
-    "local_intensity_mz_plus14", "local_peak_density",
+    # peak-level descriptors
+    "peak_nominal_mz",
+    "peak_intensity",
+    "peak_rel_intensity",
+    "local_intensity_mz",
+    "local_intensity_mz_minus1",
+    "local_intensity_mz_plus1",
+    "local_intensity_mz_minus14",
+    "local_intensity_mz_plus14",
+    "local_peak_density",
 
-    # fragment-level
-    "frag_mass", "frag_dbe", "mass_fraction", "confidence",
+    # fragment-level descriptors
+    "frag_mass",
+    "frag_dbe",
+    "mass_fraction",
+    "confidence",
+
+    # fragment element counts
+    "frag_n_C", "frag_n_H", "frag_n_O", "frag_n_N",
+    "frag_n_S", "frag_n_P",
+    "frag_n_F", "frag_n_Cl", "frag_n_Br", "frag_n_I",
+    "frag_n_halogen",
 
     # categorical
     "rule_family",
