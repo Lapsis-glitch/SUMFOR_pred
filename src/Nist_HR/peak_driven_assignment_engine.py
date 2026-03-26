@@ -85,6 +85,14 @@ class PeakDrivenAssignmentEngine:
             candidates = self.enumerator.enumerate_for_peak(nominal_mz)
             # candidates: [(frag, rule_source, depth), ...]
 
+            # # DEBUG: count BDE vs rule-based fragments before physics filtering
+            # bde_candidates = [c for c in candidates if "bde" in c[1]]
+            # rule_candidates = [c for c in candidates if "bde" not in c[1]]
+            #
+            # print(f"[DEBUG] Peak {nominal_mz}:")
+            # print(f"  BDE candidates before physics: {len(bde_candidates)}")
+            # print(f"  Rule-based candidates before physics: {len(rule_candidates)}")
+
             if not candidates:
                 assignments.append(
                     PeakAssignment(
@@ -126,6 +134,22 @@ class PeakDrivenAssignmentEngine:
 
             # discriminative confidence
             conf_scores = self._compute_confidences(raw_scores)
+
+            # # DEBUG: count BDE vs rule-based survivors
+            # bde_survivors = 0
+            # rule_survivors = 0
+            #
+            # for (frag, rule_source, depth), conf in zip(candidates, conf_scores):
+            #     if conf > 0.0:
+            #         if "bde" in rule_source:
+            #             bde_survivors += 1
+            #         else:
+            #             rule_survivors += 1
+            #
+            # print(f"  BDE survivors after physics: {bde_survivors}")
+            # print(f"  Rule-based survivors after physics: {rule_survivors}")
+            # print(f"  BDE eliminated by physics: {len(bde_candidates) - bde_survivors}")
+            # print()
 
             # no-assignment case
             if all(c == 0.0 for c in conf_scores):

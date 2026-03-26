@@ -67,7 +67,6 @@ class HybridEnumerator:
     def _merge_enumerators(self):
         merged = {}
 
-        # Helper to insert fragments
         def add_frag(frag: Formula, rule: str, depth: int):
             key = frag.to_string()
             if key not in merged:
@@ -80,17 +79,48 @@ class HybridEnumerator:
                 merged[key]["rule_sources"].add(rule)
                 merged[key]["depth"] = min(merged[key]["depth"], depth)
 
-        # Add rule-based fragments
+        # ------------------------------------------------------------
+        # 1. Add rule-based fragments
+        # ------------------------------------------------------------
         for nm, frags in self.rule_enum.lookup.items():
             for frag, rule, depth in frags:
                 add_frag(frag, rule, depth)
 
-        # Add BDE-based fragments
+        # ------------------------------------------------------------
+        # 2. Add BDE-based fragments
+        # ------------------------------------------------------------
+        bde_frags = []
         for nm, frags in self.bde_enum.lookup.items():
             for frag, rule, depth in frags:
                 add_frag(frag, rule, depth)
+                bde_frags.append((frag, rule, depth))
 
-        # Build final lookup by nominal mass
+        # ------------------------------------------------------------
+        # 3. Apply rule-based fragmentation to BDE fragments
+        # ------------------------------------------------------------
+        for frag, rule, depth in bde_frags:
+
+            # Only expand if depth < max_depth
+            if depth >= self.max_depth:
+                continue
+
+            # Generate rule-based fragments from this BDE fragment
+            rule_frags = self.rule_enum.enumerate_formula(frag, depth + 1)
+
+            for rf, rrule, rdepth in rule_frags:
+
+                # Sanity filters
+                if exact_mass(rf) < 10:
+                    continue
+                # if not rf.is_subset_of(self.parent_formula):
+                #     continue
+
+                combined_rule = f"{rule}+{rrule}"
+                add_frag(rf, combined_rule, depth + 1)
+
+        # ------------------------------------------------------------
+        # 4. Build final lookup by nominal mass
+        # ------------------------------------------------------------
         lookup = {}
         for key, info in merged.items():
             frag = info["frag"]

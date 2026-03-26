@@ -29,7 +29,22 @@ def break_bonds(mol, bonds_to_break):
     for bidx in bonds_to_break:
         bond = rw.GetBondWithIdx(bidx)
         rw.RemoveBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
-    return Chem.GetMolFrags(rw.GetMol(), asMols=True, sanitizeFrags=True)
+    frags = Chem.GetMolFrags(rw.GetMol(), asMols=True, sanitizeFrags=False)
+
+    clean_frags = []
+    for f in frags:
+        try:
+            Chem.SanitizeMol(f)
+        except Exception:
+            # fallback: try sanitizing with flags
+            try:
+                Chem.SanitizeMol(f, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE)
+            except Exception:
+                pass  # last resort: leave unsanitized
+        clean_frags.append(f)
+
+    return clean_frags
+
 
 
 # ---------------------------------------------------------
@@ -48,7 +63,7 @@ def estimate_intensity(bde, softness=30.0):
 # One-step fragmentation (break all bonds < threshold)
 # ---------------------------------------------------------
 
-def fragment_by_bde(mol, bond_data, threshold=100.0):
+def fragment_by_bde(mol, bond_data, threshold=120.0):
     """
     Break all bonds with BDE < threshold.
     Returns fragments with:
@@ -76,7 +91,7 @@ def fragment_by_bde(mol, bond_data, threshold=100.0):
         results.append({
             "mol": f,
             "smiles": smiles_clean,
-            "formula": str(formula),
+            "formula": formula,
             "mass": mass,
             "atom_indices": [a.GetIdx() for a in f.GetAtoms()]
         })
@@ -88,7 +103,7 @@ def fragment_by_bde(mol, bond_data, threshold=100.0):
 # Recursive fragmentation tree
 # ---------------------------------------------------------
 
-def recursive_fragment(mol, bond_data, depth=0, max_depth=3, threshold=100.0, softness=25.0):
+def recursive_fragment(mol, bond_data, depth=0, max_depth=8, threshold=120.0, softness=25.0):
     """
     Recursively fragment a molecule based on BDE.
     Returns a fragmentation tree node:
@@ -102,11 +117,19 @@ def recursive_fragment(mol, bond_data, depth=0, max_depth=3, threshold=100.0, so
     # Compute parent node info
     formula = mol_to_formula(mol)
     mass = exact_mass(formula, charged=True)
-    smiles_clean = Chem.MolToSmiles(Chem.RemoveHs(mol), canonical=True)
+    # smiles_clean = Chem.MolToSmiles(Chem.RemoveHs(mol), canonical=True)
+    try:
+        smiles_clean = Chem.MolToSmiles(Chem.RemoveHs(mol), canonical=True, kekuleSmiles=False)
+    except Exception:
+        # fallback: remove Hs and try again
+        try:
+            smiles_clean = Chem.MolToSmiles(Chem.RemoveHs(mol), canonical=True, kekuleSmiles=False)
+        except Exception:
+            smiles_clean = "[UNSANITIZED]"
 
     node = {
         "smiles": smiles_clean,
-        "formula": str(formula),
+        "formula": formula,
         "mass": mass,
         "children": []
     }
@@ -131,7 +154,14 @@ def recursive_fragment(mol, bond_data, depth=0, max_depth=3, threshold=100.0, so
         for f in frags:
             f_formula = mol_to_formula(f)
             f_mass = exact_mass(f_formula, charged=True)
-            f_smiles = Chem.MolToSmiles(Chem.RemoveHs(f), canonical=True)
+            try:
+                f_smiles = Chem.MolToSmiles(f, canonical=True, kekuleSmiles=False)
+            except Exception:
+                # fallback: remove Hs and try again
+                try:
+                    f_smiles = Chem.MolToSmiles(Chem.RemoveHs(f), canonical=True, kekuleSmiles=False)
+                except Exception:
+                    f_smiles = "[UNSANITIZED]"
 
             # EI intensity model (70 eV calibrated)
             intensity = math.exp(-b["bde"] / softness)
@@ -158,7 +188,7 @@ def recursive_fragment(mol, bond_data, depth=0, max_depth=3, threshold=100.0, so
 
             child_node = {
                 "smiles": f_smiles,
-                "formula": str(f_formula),
+                "formula": f_formula,
                 "mass": f_mass,
                 "intensity": intensity,
                 "children": subtree["children"]

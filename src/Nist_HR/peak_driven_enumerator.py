@@ -40,3 +40,11 @@ class PeakDrivenEnumerator:
         Return only fragments that match the target nominal m/z.
         """
         return self.lookup.get(target_nominal_mz, [])
+
+    def enumerate_formula(self, formula: Formula, depth: int = 0):
+        """
+        Public wrapper to fragment an arbitrary Formula using the same
+        rule-based logic as the parent enumerator.
+        """
+        fraggen = RecursiveFragmenter(formula, self.rule_flags, max_depth=self.max_depth)
+        return fraggen.generate(start_depth=depth)

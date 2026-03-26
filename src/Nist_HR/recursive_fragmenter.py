@@ -13,7 +13,6 @@ class RecursiveFragmenter:
     max_depth = 1 → primary fragments only
     max_depth = 2 → secondary fragments
     max_depth = 3 → tertiary fragments
-    etc.
     """
 
     def __init__(self, parent: Formula, rule_flags: Dict[str, bool], max_depth: int = 1):
@@ -21,25 +20,25 @@ class RecursiveFragmenter:
         self.rule_flags = rule_flags
         self.max_depth = max_depth
 
-    def generate(self) -> List[Tuple[Formula, str, int]]:
+    def generate(self, start_depth: int = 1) -> List[Tuple[Formula, str, int]]:
         """
         Returns a list of (fragment_formula, rule_source, depth)
-        where depth = 1 (primary), 2 (secondary), etc.
+        where depth = start_depth (primary), start_depth+1 (secondary), etc.
         """
         results: Dict[str, Tuple[Formula, str, int]] = {}
         visited: Set[str] = set()
 
-        # Depth 1: primary fragments
+        # Depth = start_depth: primary fragments
         primary = generate_rule_based_fragments(self.parent, self.rule_flags)
         for frag, rule in primary:
             key = frag.to_string()
-            results[key] = (frag, rule, 1)
+            results[key] = (frag, rule, start_depth)
             visited.add(key)
 
         current_level = primary
 
-        # Depth >= 2: recursive fragmentation
-        for depth in range(2, self.max_depth + 1):
+        # Depth >= start_depth+1: recursive fragmentation
+        for depth in range(start_depth + 1, self.max_depth + 1):
             next_level = []
 
             for frag, rule in current_level:
@@ -60,3 +59,8 @@ class RecursiveFragmenter:
                 break
 
         return list(results.values())
+
+    # NEW: public API for HybridEnumerator
+    def fragment_formula(self, formula: Formula, start_depth: int = 1):
+        fragger = RecursiveFragmenter(formula, self.rule_flags, max_depth=self.max_depth)
+        return fragger.generate(start_depth=start_depth)

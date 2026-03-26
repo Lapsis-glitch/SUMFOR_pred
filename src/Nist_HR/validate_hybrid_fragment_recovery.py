@@ -8,7 +8,7 @@ import json
 from Large_data import ENTRY_IDS, run_single_entry
 
 TOL = 0.0001
-HYBRID_THR = 0.7
+HYBRID_THR = 0.65
 
 
 def is_correct(frag_mz, aml_mz_list, tol=TOL):
@@ -150,6 +150,29 @@ def main():
     plt.title("Distribution of Predicted Fragments per Spectrum")
     plt.xlabel("Number of predicted fragments")
     plt.ylabel("Number of spectra")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+    # ------------------------------------------------------------
+    # Scatterplot: predicted fragment count vs precision
+    # ------------------------------------------------------------
+    plt.figure(figsize=(8, 6))
+    plt.scatter(pred_arr, arr, alpha=0.6, color="purple", edgecolor="black")
+
+    plt.title("Precision vs Number of Predicted Fragments")
+    plt.xlabel("Number of predicted fragments")
+    plt.ylabel("Precision (correct / predicted)")
+
+    # Trend line (optional but useful)
+    if len(pred_arr) > 1:
+        z = np.polyfit(pred_arr, arr, 1)
+        p = np.poly1d(z)
+        xs = np.linspace(pred_arr.min(), pred_arr.max(), 200)
+        plt.plot(xs, p(xs), "r--", linewidth=2, label="Trend line")
+        plt.legend()
+
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.show()

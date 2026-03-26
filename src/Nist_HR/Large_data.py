@@ -13,7 +13,8 @@ from rdkit import Chem
 from ml_correction_integration import apply_ml_correction
 
 MIN_REL_INTENSITY = 0.05
-MERGED_PATH = "/mnt/d/Leco/merged_clean_SIP.json"
+# MERGED_PATH = "/mnt/d/Leco/merged_clean_SIP.json"
+MERGED_PATH = "/mnt/d/Leco/merged_clean_SIP_with_pubchem_bde.json"
 
 # Allowed elements
 ALLOWED_ELEMENTS = {"C", "H", "O", "N", "Cl", "Br", "F", "I", "S", "P"}
@@ -93,7 +94,7 @@ def run_single_entry(entry_id: str):
     rel_int_filt = [rI for _, _, rI in nist_peaks_filtered]
 
     # Fragment rules
-    FRAG_DEPTH = 3
+    FRAG_DEPTH = 5
     rule_flags = {
         "neutral_losses": True,
         "double_neutral_losses": True,
@@ -126,7 +127,13 @@ def run_single_entry(entry_id: str):
     # Hybrid or fallback enumerator
     # -----------------------------
     pubchem = entry.get("pubchem")
-    bde_data = entry.get("bde_data") or entry.get("bde")  # support both names
+    # bde_data = entry.get("bde_data") or entry.get("bde")  # support both names
+    raw_bde = entry.get("bde_data")
+    bde_data = None
+
+    if raw_bde and "bonds" in raw_bde:
+        # Filter out null BDEs
+        bde_data = [b for b in raw_bde["bonds"] if b["bde"] is not None]
 
     use_hybrid = False
     mol = None
@@ -148,6 +155,7 @@ def run_single_entry(entry_id: str):
     if mol is not None and bde_data:
         use_hybrid = True
 
+
     # Choose enumerator
     if use_hybrid:
         peak_enum = HybridEnumerator(
@@ -156,8 +164,8 @@ def run_single_entry(entry_id: str):
             bde_data,
             rule_flags=rule_flags,
             max_depth=FRAG_DEPTH,
-            bde_threshold=100.0,
-            bde_softness=25.0,
+            bde_threshold=120.0,
+            bde_softness=50.0,
         )
     else:
         # Fallback: rule-based only

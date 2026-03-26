@@ -24,8 +24,8 @@ class BDEDrivenEnumerator:
         parent_formula: Formula,
         mol,
         bond_data,
-        max_depth: int = 2,
-        threshold: float = 100.0,
+        max_depth: int = 5,
+        threshold: float = 120.0,
         softness: float = 25.0,
     ):
         self.parent_formula = parent_formula
@@ -43,9 +43,13 @@ class BDEDrivenEnumerator:
             threshold=threshold,
             softness=softness,
         )
+        # print("\n=== DEBUG: ROOT NODE FROM BDE FRAGMENTER ===")
+        # print(self.tree)
+        # print("=== END DEBUG ===\n")
 
         # 2) Flatten into (Formula, rule_source, depth)
         flat = self._flatten_tree(self.tree)
+        self.debug_total_bde_frags = len(flat)
 
         # 3) Build lookup by nominal mass
         self.lookup = {}
@@ -54,6 +58,13 @@ class BDEDrivenEnumerator:
             self.lookup.setdefault(nm, []).append(
                 (frag_formula, rule_source, depth)
             )
+        # self.debug_surviving_frags = sum(len(v) for v in self.lookup.values())
+        #
+        # print(f"[BDE DEBUG] Entry: {self.parent_formula}")
+        # print(f"  Total BDE fragments generated: {self.debug_total_bde_frags}")
+        # print(f"  Surviving after physics rules: {self.debug_surviving_frags}")
+        # print(f"  Eliminated: {self.debug_total_bde_frags - self.debug_surviving_frags}")
+        # print()
 
     # ------------------------------------------------------------
     # Flatten the BDE fragmentation tree
@@ -66,7 +77,16 @@ class BDEDrivenEnumerator:
         out = []
 
         # Convert formula string → Formula object
-        frag_formula = Formula.from_string(node["formula"])
+        # frag_formula = Formula.from_string(node["formula"])
+        raw = node["formula"]
+
+        # raw is now a Formula object
+        if isinstance(raw, Formula):
+            frag_formula = raw
+        else:
+            # fallback for safety
+            frag_formula = Formula.from_string(raw)
+
         rule_source = f"bde_depth_{depth}"
 
         out.append((frag_formula, rule_source, depth))

@@ -4,7 +4,7 @@ import pandas as pd
 import lightgbm as lgb
 import numpy as np
 import json
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import (
     roc_auc_score,
     average_precision_score,
@@ -25,16 +25,7 @@ df = pd.read_csv(TRAIN_CSV)
 # Remove rows with missing critical values
 df = df.dropna(subset=["frag_mass", "confidence", "parent_mass"])
 
-
-# ------------------------------------------------------------
-# Train/validation split by entry_id
-# ------------------------------------------------------------
-unique_ids = df["entry_id"].unique()
-train_ids, val_ids = train_test_split(
-    unique_ids, test_size=0.2, random_state=42
-)
-
-print(f"Total unique entries: {len(unique_ids)}")
+print(f"Loaded {len(df):,} rows from {TRAIN_CSV}")
 
 
 # ------------------------------------------------------------
@@ -64,27 +55,15 @@ df = pd.concat([df, class_features], axis=1)
 df["rule_family"] = df["rule_family"].fillna("none").astype("category")
 
 
-# Re-split after adding features / dtypes
-train_df = df[df["entry_id"].isin(train_ids)]
-val_df   = df[df["entry_id"].isin(val_ids)]
-
-print(f"Training fragments: {len(train_df)}")
-print(f"Validation fragments: {len(val_df)}")
-
-
 # ------------------------------------------------------------
 # Feature selection
 # ------------------------------------------------------------
-feature_cols = [
-
-    # parent-level descriptors
+base_features = [
     "parent_mass", "parent_dbe",
     "n_C", "n_H", "n_O", "n_N",
     "n_S", "n_P",
     "n_F", "n_Cl", "n_Br", "n_I",
     "n_halogen",
-
-    # NIST global descriptors
     "nist_n_peaks",
     "nist_base_mz",
     "nist_base_intensity",
@@ -100,8 +79,6 @@ feature_cols = [
     "has_cl_pattern",
     "has_br_pattern",
     "has_i_pattern",
-
-    # peak-level descriptors
     "peak_nominal_mz",
     "peak_intensity",
     "peak_rel_intensity",
@@ -111,40 +88,126 @@ feature_cols = [
     "local_intensity_mz_minus14",
     "local_intensity_mz_plus14",
     "local_peak_density",
-
-    # fragment-level descriptors
     "frag_mass",
     "frag_dbe",
     "mass_fraction",
     "confidence",
-
-    # fragment element counts
     "frag_n_C", "frag_n_H", "frag_n_O", "frag_n_N",
     "frag_n_S", "frag_n_P",
     "frag_n_F", "frag_n_Cl", "frag_n_Br", "frag_n_I",
     "frag_n_halogen",
-
-    # categorical
     "rule_family",
 ]
 
-# Add class_* columns
+new_feature_candidates = [
+    "is_bde_fragment",
+    "n_bde_steps",
+    "n_rule_steps",
+    "path_length",
+    "contains_aromatic_rule",
+    "contains_neutral_loss",
+    "contains_rearrangement",
+    "mass_defect",
+    "H_to_C_ratio",
+    "N_to_C_ratio",
+    "O_to_C_ratio",
+    "is_common_ei_ion",
+    "distance_to_nearest_peak",
+    "intensity_of_nearest_peak",
+    "within_1Da",
+    "within_2Da",
+]
+
+new_features = [f for f in new_feature_candidates if f in df.columns]
+
+feature_cols = base_features + new_features
 feature_cols += [c for c in df.columns if c.startswith("class_")]
 
-X_train = train_df[feature_cols]
-y_train = train_df["label"]
+print(f"Total features used: {len(feature_cols)}")
 
-X_val = val_df[feature_cols]
-y_val = val_df["label"]
 
-# Categorical features for LightGBM
+# ------------------------------------------------------------
+# Prepare data
+# ------------------------------------------------------------
+X = df[feature_cols]
+y = df["label"]
+groups = df["entry_id"]
+
 categorical_features = ["rule_family"]
 
 
 # ------------------------------------------------------------
-# LightGBM model
+# K-Fold Cross Validation (Stratified by label, grouped by molecule)
 # ------------------------------------------------------------
-model = lgb.LGBMClassifier(
+kf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+
+fold_metrics = []
+feature_importances = np.zeros(len(feature_cols))
+
+fold_idx = 1
+
+for train_idx, val_idx in kf.split(X, y, groups):
+    print(f"\n=== Fold {fold_idx} ===")
+
+    X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+    y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+    model = lgb.LGBMClassifier(
+        n_estimators=1600,
+        learning_rate=0.03,
+        max_depth=-5,
+        num_leaves=196,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        class_weight="balanced",
+        random_state=42,
+        verbose=-1,
+    )
+
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        eval_metric="auc",
+        categorical_feature=categorical_features,
+    )
+
+    val_pred = model.predict_proba(X_val)[:, 1]
+
+    auc = roc_auc_score(y_val, val_pred)
+    ap  = average_precision_score(y_val, val_pred)
+    acc = accuracy_score(y_val, (val_pred > 0.5).astype(int))
+    f1  = f1_score(y_val, (val_pred > 0.5).astype(int))
+
+    print(f"AUC: {auc:.4f}")
+    print(f"AP:  {ap:.4f}")
+    print(f"ACC: {acc:.4f}")
+    print(f"F1:  {f1:.4f}")
+
+    fold_metrics.append({"auc": auc, "ap": ap, "acc": acc, "f1": f1})
+    feature_importances += model.feature_importances_
+
+    fold_idx += 1
+
+
+# ------------------------------------------------------------
+# Average metrics across folds
+# ------------------------------------------------------------
+avg_metrics = {
+    "auc": np.mean([m["auc"] for m in fold_metrics]),
+    "ap":  np.mean([m["ap"]  for m in fold_metrics]),
+    "acc": np.mean([m["acc"] for m in fold_metrics]),
+    "f1":  np.mean([m["f1"]  for m in fold_metrics]),
+}
+
+print("\n=== Average CV Performance ===")
+for k, v in avg_metrics.items():
+    print(f"{k.upper()}: {v:.4f}")
+
+
+# ------------------------------------------------------------
+# Train final model on all data
+# ------------------------------------------------------------
+final_model = lgb.LGBMClassifier(
     n_estimators=1600,
     learning_rate=0.03,
     max_depth=-5,
@@ -156,42 +219,19 @@ model = lgb.LGBMClassifier(
     verbose=-1,
 )
 
-model.fit(
-    X_train, y_train,
-    eval_set=[(X_val, y_val)],
-    eval_metric="auc",
+final_model.fit(
+    X, y,
     categorical_feature=categorical_features,
 )
 
-
-# ------------------------------------------------------------
-# Validation metrics
-# ------------------------------------------------------------
-val_pred = model.predict_proba(X_val)[:, 1]
-
-auc = roc_auc_score(y_val, val_pred)
-ap  = average_precision_score(y_val, val_pred)
-acc = accuracy_score(y_val, (val_pred > 0.5).astype(int))
-f1  = f1_score(y_val, (val_pred > 0.5).astype(int))
-
-print("\nValidation performance:")
-print(f"AUC: {auc:.4f}")
-print(f"Average Precision: {ap:.4f}")
-print(f"Accuracy: {acc:.4f}")
-print(f"F1 score: {f1:.4f}")
+final_model.booster_.save_model(MODEL_OUT)
+print(f"\nSaved final model to {MODEL_OUT}")
 
 
 # ------------------------------------------------------------
-# Save model
+# Save averaged feature importance
 # ------------------------------------------------------------
-model.booster_.save_model(MODEL_OUT)
-print(f"Saved model to {MODEL_OUT}")
-
-
-# ------------------------------------------------------------
-# Save feature importance
-# ------------------------------------------------------------
-importance = dict(zip(feature_cols, model.feature_importances_.tolist()))
+importance = dict(zip(feature_cols, feature_importances.tolist()))
 with open(FEATURES_OUT, "w") as f:
     json.dump(importance, f, indent=2)
 
