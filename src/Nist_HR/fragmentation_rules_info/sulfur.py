@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 from typing import List, Tuple
-from src.Nist_HR.formula import Formula
-from src.Nist_HR.fragmentation_rules_info.base import subtract, subset_of_parent
-from src.Nist_HR.fragmentation_rules_info.universal import ALPHA_CLEAVAGE_LOSSES
+from formula import Formula
+from .base import subtract, subset_of_parent
+from .universal import ALPHA_CLEAVAGE_LOSSES
 
 
 # ------------------------------------------------------------
@@ -16,6 +16,12 @@ SO2_LOSS = Formula({"S": 1, "O": 2})     # sulfones, sulfonates, sulfonamides
 BETA_S_LOSSES = [
     Formula({"C": 2, "H": 6, "S": 1}),   # C2H6S
     Formula({"C": 3, "H": 8, "S": 1}),   # C3H8S
+]
+
+# C9: Thiophene / thiophenyl cations (sulfur aromatics)
+SULFUR_AROMATIC_CATIONS = [
+    Formula({"C": 4, "H": 3, "S": 1}),   # C4H3S+  (83 Da) — thiophene cation
+    Formula({"C": 1, "H": 1, "S": 1}),   # CHS+    (45 Da)
 ]
 
 def generate_beta_s(parent, fg):
@@ -74,6 +80,20 @@ def generate(parent: Formula, fg: dict) -> List[Tuple[Formula, str]]:
         if frag is not None:
             results.append((frag, "sulfur_SO2_loss"))
 
+    # --------------------------------------------------------
+    # Rule 4: Beta-S losses
+    # --------------------------------------------------------
     results.extend(generate_beta_s(parent, fg))
+
+    # --------------------------------------------------------
+    # Rule 5: C9 — Sulfur-aromatic cations (thiophene, CHS+)
+    # Gate: sulfur + aromatic, or DBE >= 2 (catches 5-membered
+    #       S-heterocycles like thiophene which has DBE = 3)
+    # --------------------------------------------------------
+    from chemistry import dbe as _dbe
+    if fg.get("aromatic", False) or _dbe(parent) >= 2:
+        for ion in SULFUR_AROMATIC_CATIONS:
+            if subset_of_parent(ion, parent):
+                results.append((ion, "sulfur_aromatic_cation"))
 
     return results

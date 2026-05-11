@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 from typing import List, Tuple
-from src.Nist_HR.formula import Formula
-from src.Nist_HR.fragmentation_rules_info.base import subtract, subset_of_parent
+from formula import Formula
+from .base import subtract, subset_of_parent, generate_beta_o
 
 
 # ------------------------------------------------------------
@@ -38,18 +38,23 @@ COMMON_CATIONS = [
 
 
 # ------------------------------------------------------------
-# Alpha-cleavage losses
+# Alpha-cleavage losses (C5: extended to C4)
 # ------------------------------------------------------------
 ALPHA_CLEAVAGE_LOSSES = [
     Formula({"C": 1, "H": 3}),
     Formula({"C": 1, "H": 2}),
     Formula({"C": 2, "H": 5}),
     Formula({"C": 2, "H": 4}),
+    # C5: Larger alkyl series for long-chain aliphatics
+    Formula({"C": 3, "H": 6}),          # C3H6
+    Formula({"C": 3, "H": 7}),          # C3H7•
+    Formula({"C": 4, "H": 8}),          # C4H8
+    Formula({"C": 4, "H": 9}),          # C4H9•
 ]
 
 
 # ------------------------------------------------------------
-# NEW: Beta-cleavage losses
+# Beta-cleavage losses
 # ------------------------------------------------------------
 BETA_CLEAVAGE_LOSSES = [
     Formula({"C": 2, "H": 5}),   # C2H5•
@@ -123,6 +128,19 @@ MCLAFFERTY_LOSSES = [
 
 
 # ------------------------------------------------------------
+# C10: Double / consecutive neutral losses
+# Pre-computed at depth 1 to avoid depth penalty from recursion
+# ------------------------------------------------------------
+DOUBLE_NEUTRAL_LOSSES = [
+    (Formula({"C": 1, "H": 2, "O": 2}), "double_loss_H2O+CO"),       # H2O + CO  (46 Da)
+    (Formula({"H": 4, "O": 2}),          "double_loss_2xH2O"),        # 2× H2O   (36 Da)
+    (Formula({"C": 2, "O": 2}),          "double_loss_2xCO"),         # 2× CO    (56 Da)
+    (Formula({"C": 1, "H": 2, "O": 3}), "double_loss_CO2+H2O"),      # CO2 + H2O (62 Da)
+    (Formula({"C": 2, "H": 2, "O": 1}), "double_loss_CO+CH2"),       # CO + CH2  (42 Da)
+]
+
+
+# ------------------------------------------------------------
 # Universal rule generator
 # ------------------------------------------------------------
 def generate(parent: Formula, fg: dict) -> List[Tuple[Formula, str]]:
@@ -149,7 +167,7 @@ def generate(parent: Formula, fg: dict) -> List[Tuple[Formula, str]]:
         if frag is not None:
             results.append((frag, f"alpha_cleavage_{loss.to_string()}"))
 
-    # --- NEW: Beta cleavage ---
+    # --- Beta cleavage ---
     results.extend(generate_beta_cleavage(parent, fg))
 
     # --- Rearrangements ---
@@ -177,5 +195,15 @@ def generate(parent: Formula, fg: dict) -> List[Tuple[Formula, str]]:
             frag = subtract(parent, loss)
             if frag is not None:
                 results.append((frag, f"mclafferty_{loss.to_string()}"))
+
+    # --- C10: Double neutral losses ---
+    for loss, label in DOUBLE_NEUTRAL_LOSSES:
+        frag = subtract(parent, loss)
+        if frag is not None:
+            results.append((frag, label))
+
+    # --- A3: Shared beta-O cleavage (alcohol/ether) ---
+    # Called here (once) to avoid duplication between alcohol.py and ether.py
+    results.extend(generate_beta_o(parent, fg))
 
     return results

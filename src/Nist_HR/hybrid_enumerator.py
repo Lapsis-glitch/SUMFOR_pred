@@ -8,6 +8,7 @@ from chemistry import exact_mass
 
 from peak_driven_enumerator import PeakDrivenEnumerator
 from MLFF_fragmentation.bde_enumerator import BDEDrivenEnumerator
+from fragmentation_rules_info.base import detect_functional_groups_from_mol
 
 
 class HybridEnumerator:
@@ -34,6 +35,9 @@ class HybridEnumerator:
         self.parent_formula = parent_formula
         self.max_depth = max_depth
 
+        # D4: SMARTS-based functional group detection from Mol
+        parent_fg = detect_functional_groups_from_mol(mol) or None
+
         # -----------------------------
         # 1. Rule-based enumerator
         # -----------------------------
@@ -42,6 +46,7 @@ class HybridEnumerator:
             rule_flags=rule_flags,
             max_depth=max_depth,
             auto_detect_rules=True,
+            parent_fg=parent_fg,
         )
 
         # -----------------------------
@@ -97,8 +102,12 @@ class HybridEnumerator:
 
         # ------------------------------------------------------------
         # 3. Apply rule-based fragmentation to BDE fragments
+        #    Cap the number expanded to avoid O(N × rules) blowup
+        #    on molecules with many weak bonds.
         # ------------------------------------------------------------
-        for frag, rule, depth in bde_frags:
+        MAX_BDE_EXPAND = 150   # expand only the shallowest BDE frags
+        bde_frags.sort(key=lambda x: x[2])  # sort by depth ascending
+        for frag, rule, depth in bde_frags[:MAX_BDE_EXPAND]:
 
             # Only expand if depth < max_depth
             if depth >= self.max_depth:

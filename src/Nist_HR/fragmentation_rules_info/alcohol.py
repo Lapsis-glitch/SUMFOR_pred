@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 from typing import List, Tuple
-from src.Nist_HR.formula import Formula
-from src.Nist_HR.fragmentation_rules_info.base import subtract, subset_of_parent
+from formula import Formula
+from .base import subtract, subset_of_parent
 
 
 # ------------------------------------------------------------
@@ -23,22 +23,8 @@ ALCOHOL_GAMMA_H_SHIFT_LOSSES = [
     Formula({"C": 1, "H": 3}),          # CH3
 ]
 
-BETA_O_LOSSES = [
-    Formula({"C": 1, "H": 2, "O": 1}),   # CH2O
-    Formula({"C": 2, "H": 4, "O": 1}),   # C2H4O
-    Formula({"C": 2, "H": 6, "O": 1}),   # C2H6O
-]
-
-def generate_beta_o(parent, fg):
-    results = []
-    if not (fg.get("alcohol") or fg.get("ether")):
-        return results
-
-    for loss in BETA_O_LOSSES:
-        frag = subtract(parent, loss)
-        if frag is not None:
-            results.append((frag, f"beta_O_{loss.to_string()}"))
-    return results
+# NOTE: BETA_O_LOSSES and generate_beta_o moved to base.py (shared with ether)
+# and called from universal.py to avoid duplication.
 
 
 # ------------------------------------------------------------
@@ -71,6 +57,5 @@ def generate(parent: Formula, fg: dict) -> List[Tuple[Formula, str]]:
         if frag is not None:
             results.append((frag, f"alcohol_gamma_H_shift_{loss.to_string()}"))
 
-    results.extend(generate_beta_o(parent, fg))
 
     return results

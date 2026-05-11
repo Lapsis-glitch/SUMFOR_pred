@@ -2,8 +2,10 @@
 
 import math
 from rdkit import Chem
+from rdkit import RDLogger
+RDLogger.DisableLog('rdApp.*')   # silence sanitisation warnings
 from formula import Formula
-from src.Nist_HR.chemistry import exact_mass
+from chemistry import exact_mass
 
 
 # ---------------------------------------------------------
@@ -24,12 +26,27 @@ def mol_to_formula(mol):
 # ---------------------------------------------------------
 
 def break_bonds(mol, bonds_to_break):
-    """Return fragments after breaking specified bonds."""
+    """
+    Return fragments after breaking specified bonds.
+
+    Returns
+    -------
+    frags : list of RDKit Mol
+        Fragment molecules.
+    frag_atom_maps : list of tuple[int]
+        For each fragment, the original atom indices that belong to it.
+    """
     rw = Chem.RWMol(mol)
     for bidx in bonds_to_break:
         bond = rw.GetBondWithIdx(bidx)
         rw.RemoveBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
-    frags = Chem.GetMolFrags(rw.GetMol(), asMols=True, sanitizeFrags=False)
+
+    new_mol = rw.GetMol()
+
+    # Get atom index mappings (which original atoms belong to which fragment)
+    frag_atom_tuples = Chem.GetMolFrags(new_mol)
+
+    frags = Chem.GetMolFrags(new_mol, asMols=True, sanitizeFrags=False)
 
     clean_frags = []
     for f in frags:
@@ -43,7 +60,7 @@ def break_bonds(mol, bonds_to_break):
                 pass  # last resort: leave unsanitized
         clean_frags.append(f)
 
-    return clean_frags
+    return clean_frags, frag_atom_tuples
 
 
 
@@ -80,7 +97,7 @@ def fragment_by_bde(mol, bond_data, threshold=120.0):
     if not bonds_to_break:
         return []
 
-    frags = break_bonds(mol, bonds_to_break)
+    frags, _ = break_bonds(mol, bonds_to_break)
 
     results = []
     for f in frags:
@@ -103,7 +120,8 @@ def fragment_by_bde(mol, bond_data, threshold=120.0):
 # Recursive fragmentation tree
 # ---------------------------------------------------------
 
-def recursive_fragment(mol, bond_data, depth=0, max_depth=8, threshold=120.0, softness=25.0):
+def recursive_fragment(mol, bond_data, depth=0, max_depth=8, threshold=120.0, softness=25.0,
+                       _visited=None):
     """
     Recursively fragment a molecule based on BDE.
     Returns a fragmentation tree node:
@@ -113,15 +131,20 @@ def recursive_fragment(mol, bond_data, depth=0, max_depth=8, threshold=120.0, so
         "mass": ...,
         "children": [...]
     }
+
+    A module-level ``_visited`` set (keyed by canonical SMILES) prunes
+    duplicate sub-trees that arise when the same fragment is reached
+    via different bond-breaking orders.
     """
+    if _visited is None:
+        _visited = set()
+
     # Compute parent node info
     formula = mol_to_formula(mol)
     mass = exact_mass(formula, charged=True)
-    # smiles_clean = Chem.MolToSmiles(Chem.RemoveHs(mol), canonical=True)
     try:
         smiles_clean = Chem.MolToSmiles(Chem.RemoveHs(mol), canonical=True, kekuleSmiles=False)
     except Exception:
-        # fallback: remove Hs and try again
         try:
             smiles_clean = Chem.MolToSmiles(Chem.RemoveHs(mol), canonical=True, kekuleSmiles=False)
         except Exception:
@@ -149,33 +172,60 @@ def recursive_fragment(mol, bond_data, depth=0, max_depth=8, threshold=120.0, so
 
     for b in weak_bonds:
         # Break only this bond
-        frags = break_bonds(mol, [b["bond_index"]])
+        frags, frag_atom_maps = break_bonds(mol, [b["bond_index"]])
 
-        for f in frags:
-            f_formula = mol_to_formula(f)
-            f_mass = exact_mass(f_formula, charged=True)
+        for f, atom_map in zip(frags, frag_atom_maps):
+            # ── Deduplicate: skip if we already expanded this fragment ──
             try:
                 f_smiles = Chem.MolToSmiles(f, canonical=True, kekuleSmiles=False)
             except Exception:
-                # fallback: remove Hs and try again
                 try:
                     f_smiles = Chem.MolToSmiles(Chem.RemoveHs(f), canonical=True, kekuleSmiles=False)
                 except Exception:
                     f_smiles = "[UNSANITIZED]"
 
+            if f_smiles in _visited:
+                # Still record as a leaf child (no recursion) so the
+                # fragment itself isn't lost, just its subtree.
+                f_formula = mol_to_formula(f)
+                f_mass = exact_mass(f_formula, charged=True)
+                intensity = math.exp(-b["bde"] / softness)
+                children.append({
+                    "smiles": f_smiles,
+                    "formula": f_formula,
+                    "mass": f_mass,
+                    "intensity": intensity,
+                    "children": []
+                })
+                continue
+
+            _visited.add(f_smiles)
+
+            f_formula = mol_to_formula(f)
+            f_mass = exact_mass(f_formula, charged=True)
+
             # EI intensity model (70 eV calibrated)
             intensity = math.exp(-b["bde"] / softness)
 
-            # Recompute bond data for fragment (placeholder BDEs)
+            # A6: Propagate parent BDE data for surviving bonds
+            old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(atom_map)}
+
             f_bond_data = []
-            for bond in f.GetBonds():
-                f_bond_data.append({
-                    "bond_index": bond.GetIdx(),
-                    "atom1": bond.GetBeginAtomIdx(),
-                    "atom2": bond.GetEndAtomIdx(),
-                    "bond_type": str(bond.GetBondType()),
-                    "bde": 999.0  # placeholder until MACE-BDE is run on fragments
-                })
+            for parent_bond in bond_data:
+                a1 = parent_bond["atom1"]
+                a2 = parent_bond["atom2"]
+                if a1 in old_to_new and a2 in old_to_new:
+                    new_a1 = old_to_new[a1]
+                    new_a2 = old_to_new[a2]
+                    frag_bond = f.GetBondBetweenAtoms(new_a1, new_a2)
+                    if frag_bond is not None:
+                        f_bond_data.append({
+                            "bond_index": frag_bond.GetIdx(),
+                            "atom1": new_a1,
+                            "atom2": new_a2,
+                            "bond_type": parent_bond["bond_type"],
+                            "bde": parent_bond["bde"],
+                        })
 
             # Recursive step
             subtree = recursive_fragment(
@@ -183,7 +233,8 @@ def recursive_fragment(mol, bond_data, depth=0, max_depth=8, threshold=120.0, so
                 depth=depth + 1,
                 max_depth=max_depth,
                 threshold=threshold,
-                softness=softness
+                softness=softness,
+                _visited=_visited,
             )
 
             child_node = {

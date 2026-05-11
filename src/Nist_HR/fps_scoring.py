@@ -29,39 +29,81 @@ FPS_WEIGHTS: Dict[str, float] = {
 }
 
 # Rule-family priors (also tunable)
+# A5: Uses prefix matching — the first key found in the rule_source string wins.
+# Order matters: more specific prefixes should come before less specific ones.
 RULE_FAMILY_PRIORS: Dict[str, float] = {
+    # --- universal ---
     "neutral_loss":        0.5,
     "double_loss":         0.3,
-    "cation":              0.7,
-    "alpha":               0.6,
+    "common_cation":       0.7,
+    "alpha_cleavage":      0.6,
+    "beta_cleavage":       0.5,
     "rearrangement":       0.4,
     "oxygen_adjacent":     0.6,
     "hydrogen_transfer":   0.3,
     "mclafferty":          0.7,
+    "beta_O":              0.6,
 
-    "alcohol_beta":        0.7,
-    "alcohol_dehydration": 0.8,
-    "alcohol_gamma_shift": 0.5,
+    # --- alcohol ---
+    "alcohol_beta_cleavage":   0.7,
+    "alcohol_dehydration":     0.8,
+    "alcohol_gamma_H_shift":   0.5,
 
-    "acylium":             0.8,
+    # --- carbonyl ---
+    "acylium_ion":         0.8,
     "carbonyl_alpha":      0.7,
 
-    "tropylium":           0.9,
-    "phenyl":              0.8,
-    "benzyl":              0.8,
-    "ring_contraction":    0.5,
+    # --- aromatic ---
+    "aromatic_tropylium":          0.9,
+    "aromatic_phenyl":             0.8,
+    "aromatic_cyclopentadienyl":   0.8,
+    "aromatic_benzylic":           0.8,
+    "aromatic_ring_contraction":   0.5,
+    "aromatic_CO_loss":            0.7,
+    "rda_loss":                    0.6,
 
-    "iminium":             0.7,
+    # --- amine ---
+    "iminium_ion":         0.7,
     "amine_alpha":         0.6,
+    "amine_HCN_loss":      0.8,
+    "nitrile_CN_loss":     0.6,
+    "nitro_NO2_loss":      0.7,
+    "nitro_NO_loss":       0.6,
+    "amide_loss":          0.6,
+    "beta_N":              0.5,
 
+    # --- ester ---
     "ester_acylium":       0.7,
     "ester_alkoxy":        0.5,
 
+    # --- halogen ---
     "halogen_cation":      0.8,
     "halogen_loss":        0.6,
+    "halogen_radical":     0.6,
+    "beta_halogen":        0.5,
 
+    # --- ether ---
     "ether_alpha":         0.6,
-    "allylic":             0.7,
+
+    # --- alkene ---
+    "allylic_cation":      0.7,
+
+    # --- sulfur ---
+    "sulfur_alpha":        0.6,
+    "sulfur_H2S":          0.7,
+    "sulfur_SO2":          0.7,
+    "sulfur_aromatic":     0.7,
+    "beta_S":              0.5,
+
+    # --- phosphorus ---
+    "phosphorus_loss":     0.5,
+    "phosphorus_radical":  0.5,
+    "phosphorus_alpha":    0.6,
+    "phosphorus_cation":   0.6,
+    "beta_P":              0.5,
+
+    # --- BDE ---
+    "bde_depth":           0.5,
 }
 
 
@@ -137,6 +179,12 @@ def _spectrum_context_factor(frag: Formula,
     return min(score, 1.0)
 
 
+# FPS cap — the FP rate climbs steeply above this value,
+# so capping prevents plausible-but-wrong fragments from
+# inflating the hybrid score.
+FPS_CAP = 0.7
+
+
 # ============================================================
 # Main FPS function (now weightable)
 # ============================================================
@@ -155,8 +203,13 @@ def fragment_plausibility_score(
     mass_pos = _mass_position_factor(frag, parent)
     context = _spectrum_context_factor(frag, observed_nominals)
 
-    # rule prior
-    prior = RULE_FAMILY_PRIORS.get(rule_source or "", 0.4)
+    # rule prior — A5: use prefix matching instead of exact key lookup
+    prior = 0.4   # default
+    if rule_source:
+        for key, val in RULE_FAMILY_PRIORS.items():
+            if rule_source.startswith(key) or key in rule_source:
+                prior = val
+                break
 
     # weighted combination
     score = (
@@ -168,4 +221,4 @@ def fragment_plausibility_score(
         FPS_WEIGHTS["w_prior"]    * prior
     )
 
-    return max(0.0, min(score, 1.0))
+    return max(0.0, min(score, FPS_CAP))

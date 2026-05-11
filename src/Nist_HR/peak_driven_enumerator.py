@@ -18,7 +18,8 @@ class PeakDrivenEnumerator:
     """
 
     def __init__(self, parent: Formula, rule_flags: Dict[str, bool],
-                 max_depth: int = 1, auto_detect_rules=True):
+                 max_depth: int = 1, auto_detect_rules=True,
+                 parent_fg: Dict[str, bool] | None = None):
 
         self.parent = parent
         self.rule_flags = rule_flags
@@ -26,7 +27,10 @@ class PeakDrivenEnumerator:
         self.auto_detect_rules = auto_detect_rules
 
         # Generate recursive fragments
-        fraggen = RecursiveFragmenter(parent, rule_flags, max_depth=max_depth)
+        # D4: Pass parent_fg for SMARTS-based detection at parent level
+        fraggen = RecursiveFragmenter(
+            parent, rule_flags, max_depth=max_depth, parent_fg=parent_fg
+        )
         recursive_frags = fraggen.generate()   # (frag, rule, depth)
 
         # Build lookup by nominal mass

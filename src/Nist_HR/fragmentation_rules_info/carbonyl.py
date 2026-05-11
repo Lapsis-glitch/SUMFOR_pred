@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 from typing import List, Tuple
-from src.Nist_HR.formula import Formula
-from src.Nist_HR.fragmentation_rules_info.base import subtract, subset_of_parent
+from formula import Formula
+from .base import subtract, subset_of_parent
 
 
 # ------------------------------------------------------------

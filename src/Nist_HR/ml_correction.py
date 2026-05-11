@@ -11,8 +11,15 @@ from formula import Formula
 from chemistry import exact_mass, dbe
 from chemical_classification import classify_molecule
 
+try:
+    import joblib
+    _HAS_JOBLIB = True
+except ImportError:
+    _HAS_JOBLIB = False
+
 MODEL_OUT = "ml_correction_model_SIP.txt"
 FEATURES_IMPORTANCE = "ml_feature_importance_SIP.json"
+CALIBRATOR_PATH = "ml_calibrator_v2.pkl"
 
 
 # ------------------------------------------------------------
@@ -23,6 +30,7 @@ class MLCorrectionModel:
         self,
         model_path: str = MODEL_OUT,
         importance_path: str = FEATURES_IMPORTANCE,
+        calibrator_path: str = CALIBRATOR_PATH,
     ):
         self.booster = lgb.Booster(model_file=model_path)
 
@@ -30,6 +38,11 @@ class MLCorrectionModel:
         with open(importance_path, "r") as f:
             importance = json.load(f)
         self.feature_names = list(importance.keys())
+
+        # Optional isotonic calibrator (v2 model)
+        self.calibrator = None
+        if _HAS_JOBLIB and Path(calibrator_path).exists():
+            self.calibrator = joblib.load(calibrator_path)
 
     # --------------------------------------------------------
     # NIST global descriptors
@@ -366,5 +379,9 @@ class MLCorrectionModel:
 
         # LightGBM Booster.predict returns array-like
         prob = float(self.booster.predict(features)[0])
+
+        # Apply isotonic calibration if available
+        if self.calibrator is not None:
+            prob = float(self.calibrator.predict([prob])[0])
 
         return prob

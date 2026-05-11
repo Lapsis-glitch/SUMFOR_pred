@@ -59,16 +59,26 @@ class Formula:
 
     def to_string(self) -> str:
         """
-        Convert the formula back into a canonical string representation.
+        Convert the formula back into a canonical string representation
+        using Hill order (C first, H second, then alphabetical).
 
         Returns
         -------
         str
-            Example: {"C": 6, "H": 6} → "C6H6"
+            Example: {"C": 6, "H": 5, "Br": 1} → "C6H5Br1"
         """
+        order = []
+        elems = self.elements
+        if "C" in elems:
+            order.append("C")
+        if "H" in elems:
+            order.append("H")
+        for el in sorted(elems.keys()):
+            if el not in ("C", "H"):
+                order.append(el)
         parts = []
-        for el in sorted(self.elements.keys()):
-            n = self.elements[el]
+        for el in order:
+            n = elems[el]
             parts.append(f"{el}{n}")
         return "".join(parts)
 

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 from typing import List, Tuple
-from src.Nist_HR.formula import Formula
-from src.Nist_HR.fragmentation_rules_info.base import subtract, subset_of_parent
+from formula import Formula
+from .base import subtract, subset_of_parent
 
 
 # ------------------------------------------------------------
@@ -81,6 +81,8 @@ def generate(parent: Formula, fg: dict) -> List[Tuple[Formula, str]]:
 
     # --------------------------------------------------------
     # 2. X• radical losses (F•, Cl•, Br•, I•)
+    #    (Also covers C–X alpha cleavage, which is the same
+    #     subtraction at the formula level.)
     # --------------------------------------------------------
     for loss in HALOGEN_RADICAL_LOSSES:
         frag = subtract(parent, loss)
@@ -88,17 +90,7 @@ def generate(parent: Formula, fg: dict) -> List[Tuple[Formula, str]]:
             results.append((frag, f"halogen_radical_loss_{loss.to_string()}"))
 
     # --------------------------------------------------------
-    # 3. C–X alpha cleavage
-    # --------------------------------------------------------
-    # Approximated by subtracting X• (same as radical loss)
-    # but labeled separately for interpretability.
-    for loss in HALOGEN_RADICAL_LOSSES:
-        frag = subtract(parent, loss)
-        if frag is not None:
-            results.append((frag, f"halogen_alpha_cleavage_{loss.to_string()}"))
-
-    # --------------------------------------------------------
-    # 4. Halogen cations (X+)
+    # 3. Halogen cations (X+)
     # --------------------------------------------------------
     for ion in HALOGEN_CATIONS:
         if subset_of_parent(ion, parent):

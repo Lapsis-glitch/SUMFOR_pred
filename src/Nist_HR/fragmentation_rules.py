@@ -6,7 +6,7 @@ Modular rule-based fragment generator for EI mass spectrometry.
 This file is now a lightweight orchestrator:
 - detects functional groups
 - dispatches to rule packs via the registry
-- applies rule flags
+- applies rule flags (at the pack level, via registry)
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ def generate_rule_based_fragments(
     parent: Formula,
     rule_flags: Dict[str, bool] | None = None,
     auto_detect_rules: bool = True,
+    parent_fg: Dict[str, bool] | None = None,
 ) -> List[Tuple[Formula, str]]:
     """
     Generate fragments from a parent formula using modular rule packs.
@@ -31,9 +32,15 @@ def generate_rule_based_fragments(
         The parent molecular formula.
     rule_flags : dict
         Optional dictionary enabling/disabling rule families.
+        Keys should match pack flag keys: "alcohol", "carbonyl",
+        "aromatic", "amine", "ester", "halogen", "ether", "alkene",
+        "sulfur", "phosphorus".
         If None, all rule packs are enabled.
     auto_detect_rules : bool
         If True, detect functional groups automatically.
+    parent_fg : dict, optional
+        Pre-computed functional group dict (e.g. from SMARTS-based
+        detection). If provided, overrides auto-detection.
 
     Returns
     -------
@@ -45,20 +52,12 @@ def generate_rule_based_fragments(
         rule_flags = {}
 
     # Functional group detection
-    fg = detect_functional_groups(parent) if auto_detect_rules else {}
+    if parent_fg is not None:
+        fg = parent_fg
+    elif auto_detect_rules:
+        fg = detect_functional_groups(parent)
+    else:
+        fg = {}
 
-    # Dispatch to rule packs
-    fragments = generate_fragments(parent, fg)
-
-    # Apply rule flags (post-filter)
-    if rule_flags:
-        filtered = []
-        for frag, source in fragments:
-            # If a rule flag is explicitly disabled, skip it
-            family = source.split("_")[0]  # e.g. "alcohol", "sulfur", "neutral"
-            if family in rule_flags and not rule_flags[family]:
-                continue
-            filtered.append((frag, source))
-        return filtered
-
-    return fragments
+    # Dispatch to rule packs (flag filtering and deduplication handled by registry)
+    return generate_fragments(parent, fg, rule_flags)

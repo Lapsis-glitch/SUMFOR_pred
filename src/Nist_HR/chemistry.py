@@ -63,14 +63,17 @@ def dbe(formula: Formula) -> float:
     """
     Compute double bond equivalents (RDBE).
 
-    DBE = C - H/2 + N/2 + 1 - X/2
+    DBE = C - H/2 + N/2 + P/2 + 1 - X/2
     where X = halogens (F, Cl, Br, I).
+    Phosphorus is trivalent (like N) and contributes +P/2.
+    Sulfur and oxygen are divalent and do not appear.
     """
     elems = formula.elements
 
     C = elems.get("C", 0)
     H = elems.get("H", 0)
     N = elems.get("N", 0)
+    P = elems.get("P", 0)
     X = elems.get("F", 0) + elems.get("Cl", 0) + elems.get("Br", 0) + elems.get("I", 0)
 
-    return C - H / 2.0 + N / 2.0 + 1.0 - X / 2.0
+    return C - H / 2.0 + N / 2.0 + P / 2.0 + 1.0 - X / 2.0
