@@ -21,8 +21,8 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import json
-import sys
 from pathlib import Path
 
 import joblib
@@ -40,7 +40,8 @@ from final_decision_calibrator import (
 )
 
 BASE_DIR = Path("/home/rat/PycharmProjects/SUMFOR_pred/src/Nist_HR/validation_outputs_precision")
-METRICS_OUT = Path("/home/rat/PycharmProjects/SUMFOR_pred/src/Nist_HR/final_decision_calibrator_metrics.json")
+DEFAULT_METRICS_OUT = Path("/home/rat/PycharmProjects/SUMFOR_pred/src/Nist_HR/final_decision_calibrator_metrics.json")
+EXTENDED_THRESHOLDS = (0.90, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99)
 
 
 def _find_latest_fragment_metrics() -> Path | None:
@@ -58,30 +59,53 @@ def _load_jsonl(path: Path) -> list[dict]:
     return rows
 
 
-def _score_split(y_true, prob):
+def _score_split(y_true, prob, thresholds=EXTENDED_THRESHOLDS):
     metrics = {
         "positive_rate": float(np.mean(y_true)) if len(y_true) else None,
         "brier": float(brier_score_loss(y_true, prob)) if len(set(y_true)) > 1 else None,
         "average_precision": float(average_precision_score(y_true, prob)) if len(set(y_true)) > 1 else None,
         "roc_auc": float(roc_auc_score(y_true, prob)) if len(set(y_true)) > 1 else None,
-        "precision_at_0.90": None,
-        "count_at_0.90": 0,
-        "precision_at_0.95": None,
-        "count_at_0.95": 0,
     }
-    for thr in (0.90, 0.95):
+    for thr in thresholds:
         mask = prob >= thr
         key_p = f"precision_at_{thr:.2f}"
         key_n = f"count_at_{thr:.2f}"
         metrics[key_n] = int(mask.sum())
-        if mask.any():
-            metrics[key_p] = float(np.mean(y_true[mask]))
+        metrics[key_p] = float(np.mean(y_true[mask])) if mask.any() else None
     return metrics
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train the SUMFOR final-decision calibrator.")
+    parser.add_argument(
+        "input",
+        nargs="?",
+        default=None,
+        help="Path to fragment_metrics.jsonl. Defaults to the most recent one under validation_outputs_precision/.",
+    )
+    parser.add_argument(
+        "--output-artifact",
+        default=None,
+        help=f"Where to save the trained calibrator pkl. Defaults to {ARTIFACT_PATH}.",
+    )
+    parser.add_argument(
+        "--metrics-out",
+        default=str(DEFAULT_METRICS_OUT),
+        help="Where to save the training metrics json.",
+    )
+    parser.add_argument(
+        "--no-isotonic",
+        action="store_true",
+        help="Force-disable isotonic post-calibration (use raw logistic probabilities at inference).",
+    )
+    return parser.parse_args()
+
+
 def main():
-    if len(sys.argv) > 1:
-        metrics_path = Path(sys.argv[1]).expanduser()
+    args = _parse_args()
+
+    if args.input:
+        metrics_path = Path(args.input).expanduser()
     else:
         metrics_path = _find_latest_fragment_metrics()
         if metrics_path is None:
@@ -144,6 +168,8 @@ def main():
     iso_brier = iso_metrics.get("brier")
     if raw_brier is not None and iso_brier is not None and iso_brier <= raw_brier:
         use_isotonic = True
+    if args.no_isotonic:
+        use_isotonic = False
 
     artifact = {
         "model": model,
@@ -156,11 +182,16 @@ def main():
             "n_cal": len(cal_rows),
             "n_val": len(val_rows),
             "use_isotonic": use_isotonic,
+            "force_no_isotonic": bool(args.no_isotonic),
             "raw_metrics": raw_metrics,
             "isotonic_metrics": iso_metrics,
         },
     }
-    artifact_path = Path("/home/rat/PycharmProjects/SUMFOR_pred/src/Nist_HR") / ARTIFACT_PATH
+    artifact_path = (
+        Path(args.output_artifact).expanduser()
+        if args.output_artifact
+        else Path("/home/rat/PycharmProjects/SUMFOR_pred/src/Nist_HR") / ARTIFACT_PATH
+    )
     joblib.dump(artifact, artifact_path)
 
     report = {
@@ -172,10 +203,12 @@ def main():
         "n_val": len(val_rows),
         "feature_names": FEATURE_NAMES,
         "use_isotonic": use_isotonic,
+        "force_no_isotonic": bool(args.no_isotonic),
         "raw_metrics": raw_metrics,
         "isotonic_metrics": iso_metrics,
     }
-    with METRICS_OUT.open("w") as f:
+    metrics_out_path = Path(args.metrics_out).expanduser()
+    with metrics_out_path.open("w") as f:
         json.dump(report, f, indent=2)
 
     print("=== Final decision calibrator training ===")
@@ -183,14 +216,16 @@ def main():
     print(f"top1 rows used          : {len(top1_rows)}")
     print(f"train/cal/val rows      : {len(train_rows)} / {len(cal_rows)} / {len(val_rows)}")
     print(f"artifact                : {artifact_path}")
-    print(f"metrics                 : {METRICS_OUT}")
+    print(f"metrics                 : {metrics_out_path}")
     print("\nValidation metrics (raw logistic):")
     for k, v in raw_metrics.items():
         print(f"  {k}: {v}")
     print("\nValidation metrics (isotonic):")
     for k, v in iso_metrics.items():
         print(f"  {k}: {v}")
-    print(f"\nUsing isotonic: {use_isotonic}")
+    print(f"\nUsing isotonic at inference: {use_isotonic}")
+    if args.no_isotonic:
+        print("(--no-isotonic flag set; raw logistic probabilities will be used.)")
 
 
 if __name__ == "__main__":
