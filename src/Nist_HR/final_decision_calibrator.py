@@ -58,7 +58,21 @@ NUMERIC_FEATURES = [
     "ambiguity_penalty",
     "n_candidates_for_peak",
     "gap_to_runner_up",
+    "mass_defect_abs",
+    "mass_defect_norm",
+    "neutral_loss_plausible",
+    "isotope_consistency",
+    "dbe_distance_to_parent",
 ]
+
+# Neutral defaults for the new chemistry features when records pre-date them.
+_FEATURE_DEFAULTS = {
+    "mass_defect_abs": 0.0,
+    "mass_defect_norm": 0.0,
+    "neutral_loss_plausible": 0.5,
+    "isotope_consistency": 1.0,
+    "dbe_distance_to_parent": 0.0,
+}
 
 FEATURE_NAMES = NUMERIC_FEATURES + [f"class_{c}" for c in CLASS_FLAGS] + [f"rule_{r}" for r in RULE_FLAGS]
 
@@ -112,6 +126,8 @@ def build_feature_dict_from_record(record: dict) -> dict:
         "n_candidates_for_peak": _safe_float(record.get("n_candidates_for_peak")),
         "gap_to_runner_up": _safe_float(record.get("gap_to_runner_up")),
     }
+    for name, default in _FEATURE_DEFAULTS.items():
+        feat[name] = _safe_float(record.get(name), default)
 
     for cls in CLASS_FLAGS:
         feat[f"class_{cls}"] = 1.0 if cls in parent_classes else 0.0
@@ -138,6 +154,8 @@ def build_feature_dict_from_candidate(candidate: dict, meta_row: dict, parent_cl
         "n_candidates_for_peak": _safe_float(meta_row.get("n_candidates_for_peak")),
         "gap_to_runner_up": _safe_float(meta_row.get("gap_to_runner_up")),
     }
+    for name, default in _FEATURE_DEFAULTS.items():
+        feat[name] = _safe_float(candidate.get(name), default)
 
     for cls in CLASS_FLAGS:
         feat[f"class_{cls}"] = 1.0 if cls in parent_classes else 0.0
