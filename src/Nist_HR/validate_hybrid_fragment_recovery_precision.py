@@ -48,13 +48,14 @@ from Large_data import (
     RULE_FLAGS,
     FRAG_DEPTH,
     ALPHA,
-    MIN_REL_INTENSITY,
     USE_MULTIPLICATIVE_HYBRID,
     USE_COMPLEMENTARY_LOSS_FILTER,
     USE_MASS_DEFECT_FILTER,
     _filter_complementary_loss,
     _filter_mass_defect,
 )
+
+MIN_REL_INTENSITY = 0.03
 from chemical_classification import classify_molecule
 from final_decision_calibrator import FinalDecisionCalibrator
 from formula import Formula
@@ -78,7 +79,10 @@ STRICT_SELECTION = {
     "one_best_per_peak": True,
     "candidate_top_per_peak": 3,     # retained shelf for analysis / future rescue
     "candidate_hybrid_floor": None,  # None → retain top-N regardless of score
-    "min_frags_per_entry": 6,        # controlled rescue to a usable spectrum size
+    "min_frags_per_entry": None,     # legacy unconditional rescue (replaced by calibrated top-up below)
+    "topup_target_count": 7,         # calibrated top-up target frags per entry
+    "topup_prob_floor": 0.92,        # decision_prob floor for top-up candidates
+    "topup_max_expected_fdr": 0.05,  # cumulative expected FDR budget for top-up additions
     "rescue_hybrid_floor": 0.55,
     "rescue_ml_prob_floor": 0.50,
     "rescue_posterior_floor": 0.50,
@@ -241,6 +245,172 @@ def _softmax(values, temperature):
     if denom <= 0:
         return [1.0 / len(values)] * len(values)
     return (exp_arr / denom).tolist()
+
+
+# ── Per-fragment chemistry feature helpers ────────────────────
+# These features are computed from the PREDICTED fragment formula + the
+# PARENT formula + the NIST spectrum only. No AML reads — AML stays as the
+# end-of-pipeline verification target.
+
+_NEUTRAL_LOSS_WHITELIST = frozenset({
+    "",            # no loss (parent molecular ion)
+    "H1", "H2",
+    "C1H3", "C1H4",
+    "O1H1", "H2O1",
+    "C1O1", "C1H1O1", "C1O2", "C1H1O2",
+    "N1H2", "N1H3",
+    "C1H1N1", "C1N1",
+    "N1O1", "N1O2",
+    "F1", "H1F1",
+    "Cl1", "H1Cl1",
+    "Br1", "H1Br1",
+    "I1", "H1I1",
+    "H2S1", "H1S1", "O1S1", "O2S1",
+    "C2H2", "C2H3", "C2H4", "C2H5",
+    "C3H5", "C3H6", "C3H7",
+    "C4H8", "C4H9",
+    "C6H5", "C6H6",
+    "C1H2O1", "C1H3O1",
+    "C2H2O1", "C2H4O1", "C2H3N1",
+})
+
+# Stable A+2 abundances (NIST / IUPAC monoisotopic ratios).
+_AP2_ABUNDANCE = {"Cl": 0.3196, "Br": 0.9728, "S": 0.0443}
+# Stable A+1 abundances we care about (mostly S; ¹³C is too noisy in NIST).
+_AP1_ABUNDANCE = {"S": 0.0076}
+_ISOTOPE_ELEMENTS = ("Cl", "Br", "S")
+
+
+def _expected_isotope_ratio(frag_elems):
+    """Theoretical A+2 over A intensity ratio from element counts."""
+    ratio = 0.0
+    for el in _ISOTOPE_ELEMENTS:
+        n = frag_elems.get(el, 0)
+        if n <= 0:
+            continue
+        ratio += n * _AP2_ABUNDANCE[el]
+    return ratio
+
+
+def _peak_intensity_near(nist_mz, nist_rel_int, target_mz, tol=0.6):
+    """Return the relative intensity of the NIST peak nearest *target_mz* or 0.0."""
+    best = 0.0
+    for mz, rI in zip(nist_mz, nist_rel_int):
+        if abs(mz - target_mz) <= tol:
+            if rI > best:
+                best = rI
+    return best
+
+
+def _isotope_consistency(frag_elems, nominal_mz, nist_mz, nist_rel_int):
+    """
+    Score how well the NIST [M+2] (and [M+1] for S) peak intensities match
+    the theoretical isotope pattern for the predicted fragment formula.
+
+    Returns 1.0 when:
+      - the fragment has no isotope-bearing elements (neutral signal), or
+      - the observed [M+2]/[M] ratio matches the theoretical ratio.
+
+    Returns near 0.0 when expected isotope peaks are missing or grossly
+    mismatched (strong FP signal for halogenated fragments).
+    """
+    has_isotopes = any(frag_elems.get(el, 0) > 0 for el in _ISOTOPE_ELEMENTS)
+    if not has_isotopes:
+        return 1.0
+    if nominal_mz is None:
+        return 1.0
+
+    base_int = _peak_intensity_near(nist_mz, nist_rel_int, nominal_mz)
+    if base_int <= 0.0:
+        return 1.0
+
+    theo = _expected_isotope_ratio(frag_elems)
+    ap2_int = _peak_intensity_near(nist_mz, nist_rel_int, nominal_mz + 2)
+    obs = ap2_int / base_int if base_int > 0 else 0.0
+
+    n_S = frag_elems.get("S", 0)
+    n_Cl = frag_elems.get("Cl", 0)
+    n_Br = frag_elems.get("Br", 0)
+
+    # Missing [M+2] is a strong FP signal when Cl/Br are claimed, but S
+    # alone is too weak to flag (S [M+2] = 0.044 per S, often below noise).
+    if obs <= 1e-4 and (n_Cl + n_Br) > 0:
+        return 0.0
+    if theo <= 1e-4:
+        return 1.0
+
+    # Log-ratio score, smooth and bounded in (0, 1].
+    eps = 1e-3
+    log_diff = abs(np.log((obs + eps) / (theo + eps)))
+    score = float(np.exp(-log_diff))
+
+    # If S is the only isotope contributor and [M+2] is missing, stay neutral.
+    if n_Cl + n_Br == 0 and n_S > 0 and obs <= 1e-4:
+        return 1.0
+    return max(0.0, min(1.0, score))
+
+
+def _neutral_loss_plausibility(parent_elems, frag_elems):
+    """
+    Classify the parent − fragment neutral loss against a curated EI whitelist.
+
+    Returns:
+      1.0  — loss is a well-known EI neutral (CH3, H2O, CO, HCN, etc.)
+      0.5  — loss is a chemically plausible CHNO/CHN combination but not in the
+             whitelist
+      0.0  — loss is implausible (atom counts impossible, or only halogen lost
+             from a non-halogen parent, etc.)
+    """
+    loss = {}
+    for el, n in parent_elems.items():
+        diff = n - frag_elems.get(el, 0)
+        if diff < 0:
+            return 0.0
+        if diff > 0:
+            loss[el] = diff
+    # fragment contains element not in parent — implausible
+    for el in frag_elems:
+        if el not in parent_elems:
+            return 0.0
+
+    loss_key = Formula(loss).to_string() if loss else ""
+    if loss_key in _NEUTRAL_LOSS_WHITELIST:
+        return 1.0
+
+    # graded path: small CHNO/CHN loss with non-negative DBE
+    total_atoms = sum(loss.values())
+    if total_atoms == 0:
+        return 1.0  # already covered, defensive
+    foreign = sum(1 for el in loss if el not in ("C", "H", "N", "O"))
+    if foreign > 0:
+        # halogen / S / P loss only acceptable if matching whitelist forms
+        return 0.0
+    try:
+        loss_dbe = dbe(Formula(loss))
+    except Exception:
+        return 0.0
+    if loss_dbe < -0.5:
+        return 0.0
+    if total_atoms <= 12:
+        return 0.5
+    return 0.0
+
+
+def _mass_defect_norm(exact_mz):
+    """Kendrick-style normalized mass defect: defect / nominal_mz."""
+    if exact_mz is None:
+        return 0.0
+    nominal = round(exact_mz)
+    if nominal <= 0:
+        return 0.0
+    return float((exact_mz - nominal) / nominal)
+
+
+def _dbe_distance_to_parent(parent_dbe, frag_dbe):
+    """Non-negative DBE drop from parent to fragment (capped at 0 below)."""
+    if parent_dbe is None or frag_dbe is None:
+        return 0.0
+    return float(max(parent_dbe - frag_dbe, 0.0))
 
 
 def _rescue_priority(candidate, meta_row):
@@ -598,20 +768,37 @@ def run_single_entry_precision(entry_id: str):
     )
 
     assignments_dict = convert_assignments(assignments)
+    parent_elems = parent_formula.elements
+    parent_dbe = dbe(parent_formula)
     for idx, a in enumerate(assignments_dict):
         a["candidate_id"] = idx
         a["hybrid_score"] = _hybrid_score(a.get("score", 0.0), a.get("ml_prob", 0.0))
-        nominal = a.get("nominal_mz")
-        peak_rel = None
-        if nominal is not None and 0 <= nominal < len(rel_int):
-            # kept only for backward safety if nominal happened to be a list index
-            peak_rel = None
-        # use the actual originating peak intensity carried through the assignment
         peak_int = _safe_float(a.get("intensity"))
         a["source_peak_intensity"] = peak_int
         a["source_peak_rel_intensity"] = (
             peak_int / max_int if peak_int is not None and max_int > 0 else None
         )
+
+        frag_str = a.get("best_formula")
+        exact_mz = a.get("best_exact_mz")
+        if frag_str and exact_mz is not None:
+            try:
+                frag_f = Formula.from_string(frag_str)
+            except Exception:
+                frag_f = None
+            if frag_f is not None:
+                frag_elems = frag_f.elements
+                try:
+                    a["frag_dbe"] = float(dbe(frag_f))
+                except Exception:
+                    a["frag_dbe"] = None
+                a["mass_defect_abs"] = float(abs(exact_mz - round(exact_mz)))
+                a["mass_defect_norm"] = _mass_defect_norm(exact_mz)
+                a["dbe_distance_to_parent"] = _dbe_distance_to_parent(parent_dbe, a.get("frag_dbe"))
+                a["neutral_loss_plausible"] = _neutral_loss_plausibility(parent_elems, frag_elems)
+                a["isotope_consistency"] = _isotope_consistency(
+                    frag_elems, a.get("nominal_mz"), nist_mz, rel_int
+                )
 
     if USE_COMPLEMENTARY_LOSS_FILTER:
         assignments_dict = _filter_complementary_loss(assignments_dict, parent_formula)
@@ -891,7 +1078,11 @@ def main():
     print(f"  Peak posterior floor: {STRICT_SELECTION['peak_posterior_floor']}")
     print(f"  Peak softmax temperature: {STRICT_SELECTION['peak_softmax_temperature']}")
     print(f"  Strict min margin: {STRICT_SELECTION['min_margin_to_runner_up']}")
-    print(f"  Strict min fragments: {STRICT_SELECTION['min_frags_per_entry']}")
+    print(f"  Strict min fragments (legacy rescue): {STRICT_SELECTION['min_frags_per_entry']}")
+    print(f"  Calibrated top-up target count: {STRICT_SELECTION.get('topup_target_count')}")
+    print(f"  Calibrated top-up prob floor: {STRICT_SELECTION.get('topup_prob_floor')}")
+    print(f"  Calibrated top-up max expected FDR: {STRICT_SELECTION.get('topup_max_expected_fdr')}")
+    print(f"  Min relative intensity (shadowed): {MIN_REL_INTENSITY}")
     print(f"  Default strict acceptance floor: {STRICT_SELECTION['class_threshold_overrides']['default']['strict_acceptance_floor']}")
     print(f"  Default rescue acceptance floor: {STRICT_SELECTION['class_threshold_overrides']['default']['rescue_acceptance_floor']}")
     print(f"  Final decision layer enabled: {FINAL_DECISION_LAYER['enabled']}")
@@ -1013,6 +1204,11 @@ def main():
                         "pred_formula": a.get("best_formula"),
                         "pred_mz": frag_mz_val,
                         "mass_defect": _safe_float(mass_defect),
+                        "mass_defect_abs": _safe_float(a.get("mass_defect_abs")),
+                        "mass_defect_norm": _safe_float(a.get("mass_defect_norm")),
+                        "neutral_loss_plausible": _safe_float(a.get("neutral_loss_plausible")),
+                        "isotope_consistency": _safe_float(a.get("isotope_consistency")),
+                        "dbe_distance_to_parent": _safe_float(a.get("dbe_distance_to_parent")),
                         "frag_dbe": _safe_float(frag_dbe),
                         "neutral_loss_da": _safe_float(neutral_loss_da),
                         "rule_source": a.get("rule_source"),
