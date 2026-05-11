@@ -81,7 +81,7 @@ STRICT_SELECTION = {
     "candidate_hybrid_floor": None,  # None → retain top-N regardless of score
     "min_frags_per_entry": None,     # legacy unconditional rescue (replaced by calibrated top-up below)
     "topup_target_count": 7,         # calibrated top-up target frags per entry
-    "topup_prob_floor": 0.92,        # decision_prob floor for top-up candidates
+    "topup_prob_floor": 0.75,        # decision_prob floor for top-up candidates
     "topup_max_expected_fdr": 0.05,  # cumulative expected FDR budget for top-up additions
     "rescue_hybrid_floor": 0.55,
     "rescue_ml_prob_floor": 0.50,
@@ -158,9 +158,9 @@ STRICT_SELECTION = {
 }
 
 FINAL_DECISION_LAYER = {
-    "enabled": False,
+    "enabled": True,
     "artifact_path": "final_decision_calibrator.pkl",
-    "strict_prob_floor": 0.95,
+    "strict_prob_floor": 0.85,
     "rescue_prob_floor": 0.88,
     "use_prob_for_rescue_fdr": True,
 }
@@ -1004,6 +1004,44 @@ def _select_precision_candidates(assignments, config, parent_classes=None, decis
             meta[candidate["candidate_id"]]["selection_stage"] = "rescued"
             meta[candidate["candidate_id"]]["rescued_rank"] = rescue_rank
 
+    # Calibrated top-up: pull additional top1-per-peak candidates whose calibrator
+    # decision_prob passes the top-up floor, bounded by a cumulative expected-FDR
+    # budget. Replaces the legacy unconditional `min_frags_per_entry` rescue when
+    # a calibrator is available.
+    topup_target = config.get("topup_target_count")
+    if (
+        topup_target is not None
+        and (decision_layer or {}).get("calibrator") is not None
+        and len(strict) < topup_target
+    ):
+        topup_prob_floor = config.get("topup_prob_floor", 0.92)
+        topup_max_fdr = config.get("topup_max_expected_fdr", 0.05)
+        already = {a["candidate_id"] for a in strict}
+        topup_pool_all = [
+            a for a in retained
+            if a["candidate_id"] not in already
+            and meta[a["candidate_id"]]["rank_within_peak"] == 1
+            and (meta[a["candidate_id"]].get("decision_prob") or 0.0) >= topup_prob_floor
+        ]
+        topup_pool_all.sort(
+            key=lambda x: (meta[x["candidate_id"]].get("decision_prob") or 0.0),
+            reverse=True,
+        )
+
+        topup_pool = _filter_rescue_pool_by_expected_fdr(
+            topup_pool_all,
+            meta,
+            topup_max_fdr,
+            use_decision_prob=True,
+        )
+        needed = max(0, topup_target - len(strict))
+        for topup_rank, candidate in enumerate(topup_pool[:needed], start=1):
+            strict.append(candidate)
+            meta[candidate["candidate_id"]]["strict_selected"] = True
+            meta[candidate["candidate_id"]]["rejection_reason"] = "topup_calibrated"
+            meta[candidate["candidate_id"]]["selection_stage"] = "topup"
+            meta[candidate["candidate_id"]]["rescued_rank"] = topup_rank
+
     strict.sort(
         key=lambda x: (
             x.get("hybrid_score", 0.0),
@@ -1329,6 +1367,8 @@ def main():
     else:
         print("\nNo strict predictions passed the precision gates.")
 
+    import matplotlib
+    matplotlib.use("Agg")  # headless: save figures, never pop windows
     import matplotlib.pyplot as plt
 
     plot_dir = None
@@ -1339,7 +1379,7 @@ def main():
     def _save_and_show(fig, filename):
         if plot_dir:
             fig.savefig(os.path.join(plot_dir, filename), dpi=150, bbox_inches="tight")
-        plt.show()
+        plt.close(fig)
 
     if len(arr):
         fig1 = plt.figure(figsize=(8, 5))
