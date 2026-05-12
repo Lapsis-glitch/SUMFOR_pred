@@ -498,8 +498,20 @@ def main():
     with open(MERGED_PATH, "r") as f:
         MERGED = json.load(f)
 
-    entry_ids = sorted(MERGED.keys(), key=lambda x: int(x))
-    print(f"  {len(entry_ids)} entries")
+    all_ids = sorted(MERGED.keys(), key=lambda x: int(x))
+
+    from heldout_split import load_heldout_test_ids
+    heldout_ids = load_heldout_test_ids()
+    if heldout_ids:
+        entry_ids = [eid for eid in all_ids if str(eid) not in heldout_ids]
+        print(
+            f"  {len(entry_ids)} entries (excluded {len(all_ids) - len(entry_ids)} "
+            f"held-out test entries out of {len(heldout_ids)} reserved)"
+        )
+    else:
+        entry_ids = all_ids
+        print(f"  {len(entry_ids)} entries (no heldout_test_entries.json — using full corpus)")
+
     print(f"  Workers: {N_WORKERS}")
     print(f"  Output:  {OUT_CSV}")
     print(f"  Config:  FRAG_DEPTH={FRAG_DEPTH}  MIN_REL={MIN_REL_INTENSITY}  "

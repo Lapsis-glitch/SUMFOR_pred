@@ -1,0 +1,43 @@
+{
+  "fps_weights": {
+    "w_cation": 0.46471114489164717,
+    "w_hetero": 0.06907674999020089,
+    "w_aromatic": 0.3634591577502641,
+    "w_masspos": 0.5507226593434901,
+    "w_context": 0.4316289717915244,
+    "w_prior": 0.293949326289499
+  },
+  "rule_priors": {
+    "neutral_loss": 0.49102952003069306,
+    "double_loss": 1.0839782103832922,
+    "cation": 0.5993895840069647,
+    "alpha": 0.3702942882266182,
+    "rearrangement": 0.3988354477855847,
+    "oxygen_adjacent": 1.187000054869389,
+    "hydrogen_transfer": 0.7098322332909268,
+    "mclafferty": 0.7564831065401603,
+    "alcohol_beta": 1.1398476813333502,
+    "alcohol_dehydration": 0.7014779011436321,
+    "alcohol_gamma_shift": 0.6545466726275995,
+    "acylium": 0.4841211418727113,
+    "carbonyl_alpha": 1.0608388079165054,
+    "tropylium": 1.1926026265696035,
+    "phenyl": 0.8436484633371295,
+    "benzyl": 0.5296607473215422,
+    "ring_contraction": 0.3836365435622449,
+    "iminium": 0.48385733991838636,
+    "amine_alpha": 0.4457028071895612,
+    "ester_acylium": 1.0605112071006069,
+    "ester_alkoxy": 1.1492315255907164,
+    "halogen_cation": 1.0435092103199064,
+    "halogen_loss": 0.7335919009940546,
+    "ether_alpha": 0.6904772287891268,
+    "allylic": 0.9307674053079205
+  },
+  "scoring_params": {
+    "min_raw_score": 0.1370767100441801,
+    "margin_sharpness": 14.172515465610243,
+    "depth_penalty": 0.3259278776808359,
+    "intensity_gamma": 2.788439612521758
+  }
+}

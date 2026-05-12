@@ -43,8 +43,25 @@ Nist_HR/
 │
 ├── ml_correction.py                       ← LightGBM model class
 ├── ml_correction_integration.py           ← ML integration wrapper
-├── ml_correction_model_SIP.txt            ← trained model weights
+├── ml_correction_model_SIP.txt            ← trained model weights (no held-out entries)
+├── ml_calibrator_v2.pkl                   ← isotonic calibrator for ml_prob
 ├── ml_feature_importance_SIP.json         ← feature names
+├── train_ml_model_v2.py                   ← retrain ml_correction_model_SIP.txt
+├── collect_training_data_v2.py            ← regenerate training_fragments_*_v2.csv
+│
+├── final_decision_calibrator.py           ← post-hoc final-decision probability layer
+├── final_decision_calibrator.pkl          ← trained final-decision artifact
+├── train_final_decision_calibrator.py     ← retrain the final-decision calibrator
+│
+├── conformal_calibrator.py                ← cross-conformal p-value layer (TP null)
+├── conformal_calibration.pkl              ← frozen calibration table (K-fold OOF)
+├── build_conformal_calibration.py         ← build/refresh the conformal calibration table
+│
+├── heldout_split.py                       ← shared held-out test loader
+├── heldout_test_entries.json              ← 310 entry_ids reserved as the clean test set
+├── generate_heldout_test_set.py           ← one-shot script that wrote heldout_test_entries.json
+│
+├── validate_hybrid_fragment_recovery_precision.py  ← precision-oriented validator (strict gates + calibrator + rescue)
 │
 ├── analyze_entry_metrics.py               ← post-hoc entry analysis
 ├── plot_fragment_scores.py                ← post-hoc fragment plots
@@ -95,15 +112,21 @@ PeakDrivenAssignmentEngine        (assigns fragments to NIST peaks)
         hybrid_score              (α·physics + (1-α)·ML)
               │
               ▼
-validate_hybrid_fragment_recovery.py   ← YOU ARE HERE
+validate_hybrid_fragment_recovery_precision.py
+              │                   strict gates (hybrid / ML / posterior / acceptance)
+              ▼
+   FinalDecisionCalibrator        (decision_prob — "is this top-1 correct?")
               │
-     ┌────────┴────────┐
-     │                 │
-     ▼                 ▼
- entry_metrics     fragment_metrics     (saved results)
-     │                 │
-     ▼                 ▼
-analyze_entry_metrics.py    plot_fragment_scores.py   (post-hoc analysis)
+              ▼
+   ConformalCalibrator            (conformal_p — "how does it rank vs. known TPs?")
+              │
+     ┌────────┴────────────┐
+     │                     │
+     ▼                     ▼
+ entry_metrics      fragment_metrics + fake_spectra_strict/*.json
+     │                     │
+     ▼                     ▼
+analyze_entry_metrics.py   plot_fragment_scores.py   (post-hoc analysis)
 ```
 
 ---
@@ -149,8 +172,20 @@ analyze_entry_metrics.py    plot_fragment_scores.py   (post-hoc analysis)
 |------|---------|
 | **`ml_correction.py`** | `MLCorrectionModel` class. Loads a trained LightGBM booster and feature-name list, builds a rich feature vector (parent descriptors, fragment descriptors, NIST spectral statistics), and predicts a correctness probability for each assignment. |
 | **`ml_correction_integration.py`** | Thin integration layer. Instantiates `MLCorrectionModel` once at module level and exposes `apply_ml_correction(assignments, ...)` which mutates each assignment in-place, adding `.ml_prob`. |
-| **`ml_correction_model_SIP.txt`** | Serialised LightGBM model file (loaded at runtime). |
+| **`ml_correction_model_SIP.txt`** | Serialised LightGBM model file (loaded at runtime). Retrained on 2026-05-12 with the held-out test slice excluded (see "Clean-Room Test Set" below). The previous v1 production model is preserved as `ml_correction_model_SIP.txt.bak.2026-05-12_clean_test_setup`. |
+| **`ml_calibrator_v2.pkl`** | Isotonic post-calibration of the LightGBM raw probabilities. Used by `ml_correction.py` to convert raw scores into `ml_prob`. |
 | **`ml_feature_importance_SIP.json`** | Feature-name list and importances (used to reconstruct the feature vector order). |
+| **`train_ml_model_v2.py`** | Trainer for the LightGBM model. Reads `training_fragments_SIP_hybrid_BDE_v2.csv`, drops entries listed in `heldout_test_entries.json`, splits by `entry_id` (70/15/15), fits the model, runs isotonic calibration, and overwrites `ml_correction_model_SIP.txt`. |
+| **`collect_training_data_v2.py`** | Regenerates the training CSV by running the full enumeration + assignment pipeline on every non-heldout entry. Multi-process. |
+| **`final_decision_calibrator.py`** | Loader + feature-builder + scorer for the post-hoc final-decision calibrator. The calibrator gates the precision validator's top-1-per-peak export and powers the calibrated rescue / top-up stages. |
+| **`final_decision_calibrator.pkl`** | Trained LightGBM (+ optional isotonic) artifact. |
+| **`train_final_decision_calibrator.py`** | Trains `final_decision_calibrator.pkl` from a precision-validator `fragment_metrics.jsonl`. Drops held-out entries, then runs stratified group K-fold CV plus a 15% internal holdout. |
+| **`conformal_calibrator.py`** | `ConformalCalibrator` — frozen K-fold OOF table of (is_correct, decision_prob, parent-class stratum) used to emit per-fragment conformal p-values testing the TP null (global pooled + Mondrian class-conditional). Also provides `combine_p_values()` for spectrum-level aggregation (HMP / Fisher / Bonferroni-min / raw min). |
+| **`conformal_calibration.pkl`** | Frozen calibration table (one row per train-pool top1-per-peak fragment). Built by `build_conformal_calibration.py`. Loaded once by the precision validator. |
+| **`build_conformal_calibration.py`** | Runs stratified-group K-fold CV over the latest train-pool `fragment_metrics.jsonl`, captures each row's out-of-fold `decision_prob`, and writes `conformal_calibration.pkl`. Supports `--verify-on <test_only fragment_metrics.jsonl>` to print empirical coverage at α∈{0.01, 0.05, 0.10, 0.20}. Re-run after any change to the final-decision calibrator's model spec or training data. |
+| **`heldout_split.py`** | Tiny shared loader: `load_heldout_test_ids()`, `split_train_pool()`. Used by both trainers, the collector, and the precision validator's `SUMFOR_RUN_MODE` switch. |
+| **`heldout_test_entries.json`** | The reserved 310 entry_ids (15% of the corpus, `seed=7`). No model trains on these. |
+| **`generate_heldout_test_set.py`** | One-shot script that produced `heldout_test_entries.json`. Run with `--force` to regenerate — but doing so **invalidates every model that was trained against the previous split**. |
 
 ### Post-Hoc Analysis
 
@@ -246,6 +281,68 @@ Or run from PyCharm (uses the hardcoded default path if no argument is given).
 
 This produces box plots, violin plots, and swarm plots in `fragment_score_plots/` showing how `score`, `ml_prob`, and `hybrid_score` distributions differ between correct and incorrect fragment predictions.
 
+### 4. Run the Precision Validator (and Clean-Room Test)
+
+`validate_hybrid_fragment_recovery_precision.py` is the precision-oriented sibling of the baseline validator. It applies strict per-peak gates (hybrid threshold, ML floor, peak posterior, top1-vs-top2 margin, acceptance score, final-decision calibrator), an FDR-budgeted rescue stage, and a calibrated top-up stage. Outputs land in `validation_outputs_precision/<run_id>/`. Configuration lives in the `STRICT_SELECTION`, `FINAL_DECISION_LAYER`, and `CONFORMAL_LAYER` dicts at the top of the file.
+
+```bash
+cd src/Nist_HR
+python validate_hybrid_fragment_recovery_precision.py                      # all entries
+SUMFOR_RUN_MODE=train_pool python validate_hybrid_fragment_recovery_precision.py   # only entries the models trained on
+SUMFOR_RUN_MODE=test_only  python validate_hybrid_fragment_recovery_precision.py   # only the 310 held-out test entries
+```
+
+The `run_id` is suffixed with the mode (`..._train_pool`, `..._test_only`) so output dirs are unambiguous, and `run_summary.json` records both `run_mode` and `entries_in_run_mode`.
+
+If `conformal_calibration.pkl` is missing or `CONFORMAL_LAYER["enabled"] = False`, the run still works — it just won't emit `conformal_p_*` columns or the `spectrum_confidence` block.
+
+### 5. Build the Conformal Calibration Table
+
+The conformal layer needs a frozen calibration table of out-of-fold (OOF) calibrator predictions. Build it once after every retraining of `final_decision_calibrator.pkl`:
+
+```bash
+# Default: latest train_pool fragment_metrics.jsonl + lightgbm + 5-fold CV
+python build_conformal_calibration.py
+
+# With a coverage sanity check against a test_only run
+python build_conformal_calibration.py \
+    --verify-on validation_outputs_precision/<test_only-run>/fragment_metrics.jsonl
+```
+
+What it does: re-runs stratified-group K-fold CV (`group=entry_id`) of the calibrator over the train-pool top1-per-peak rows so every row's predicted probability comes from a fold that did not see its entry. The artifact stores `(is_correct, oof_prob, parent_class_stratum)` triples. Strata with fewer than 50 positive calibration rows auto-fall-back to the global pool at inference.
+
+Cost: a few seconds per fold on a sane `--n-jobs` (defaults to 4 — `-1` thrashes the OpenMP threads and is much slower in practice). Total wall-clock ~30–60 s for ~39k rows × 5 folds on this hardware.
+
+---
+
+## Clean-Room Test Set
+
+A 15% slice of `MERGED` (310 of 2,066 entry_ids) is reserved in `heldout_test_entries.json` and never seen by training. The split was generated once with `seed=7` — distinct from the `seed=42` used inside both trainers — so it is independent of any internal trainer split.
+
+Who honors it:
+
+| File | Behaviour |
+|------|-----------|
+| `collect_training_data_v2.py` | Skips held-out entries when generating the training CSV. |
+| `train_ml_model_v2.py` | Drops held-out rows after loading the CSV, before its internal 70/15/15 split. (Defense-in-depth — the CSV already excludes them.) |
+| `train_final_decision_calibrator.py` | Drops held-out rows from `fragment_metrics.jsonl` before its pool/holdout split. |
+| `build_conformal_calibration.py` | Drops held-out rows from `fragment_metrics.jsonl` before K-fold CV, so the calibration table is built from train-pool fragments only. |
+| `validate_hybrid_fragment_recovery_precision.py` | Filters `ENTRY_IDS` based on `SUMFOR_RUN_MODE` (see above). |
+
+Latest clean-room evaluation (`validation_outputs_precision/2026-05-12_10-22-29_test_only/`):
+
+| Metric | Value |
+|--------|-------|
+| Entries with strict predictions | 271 / 310 (87.4%) |
+| Mean precision | 0.9487 |
+| Median precision | 1.0000 |
+| Mean fragments selected / spectrum | 4.94 |
+| Mean fragments correct / spectrum | 4.70 |
+
+Compare to the most recent full-corpus tuning (`98.28% / median 7`): the ~3-point precision drop and the smaller spectrum size on never-seen entries is the honest in-distribution generalisation gap.
+
+**Regenerating the split.** Don't. Running `generate_heldout_test_set.py --force` will pick a different 15% slice and silently invalidate every artifact (`ml_correction_model_SIP.txt`, `final_decision_calibrator.pkl`, all backups dated `2026-05-12_clean_test_setup`). If a fresh split is genuinely needed, retrain both models afterwards and produce a new clean-room run.
+
 ---
 
 ## Key Concepts
@@ -276,6 +373,50 @@ For each entry, `Large_data.py` checks whether PubChem structural data (SMILES/I
 - **Yes** → `HybridEnumerator` (rules + BDE-driven structural fragmentation)
 - **No** → `PeakDrivenEnumerator` (rule-based only, fallback)
 
+### Conformal Prediction Layer
+
+The precision validator sits on a stack of five layers, each answering a sharper question than the one before:
+
+| Layer | Question it answers | Output |
+|-------|---------------------|--------|
+| **Enumerator** | What formulas could plausibly land on each peak? | candidate list per peak |
+| **Scorer** (FPS + ML correction) | How well does each candidate match physics + ML? | `physics_score`, `ml_prob`, `hybrid_score` |
+| **Strict selection** | Which one wins per peak — and is it confident enough? | one-best-per-peak after gates |
+| **Final-decision calibrator** | Given everything above, what's the probability this is a TP? | `decision_prob` ∈ [0, 1] |
+| **Conformal layer** | How does that probability *compare to known TPs*? | `conformal_p` ∈ [0, 1] |
+
+The first four are *model outputs* — they tell you what the model believes. The conformal layer is a *statistical statement* about how trustworthy that belief is, calibrated against held-out ground truth.
+
+**Intuition.** Think of `conformal_calibration.pkl` as a frozen reference deck of TP confidence scores. We built it once by running 5-fold CV on the train-pool fragments — every fragment got a calibrator probability from a fold that had never seen it. We kept only the rows that were *actually* true positives against AML. Their probabilities form the deck.
+
+At inference, a new fragment gets `decision_prob = 0.87`. We ask: *in our deck of known TPs, what fraction had a probability ≤ 0.87?* If 70% of known TPs scored worse than this, then the fragment's **conformal p-value is ~0.70** — it looks like a typical TP. A high p ⇒ "indistinguishable from known TPs." A low p ⇒ "looks worse than nearly every known TP, so probably an FP."
+
+**Mondrian (class-aware).** Separate decks per parent-class group (`aromatic`, `halogenated`, `nitrogenous`, `oxygenated`, `phosphorus`, `sulfur`, `other`) so a halogenated fragment is compared only to halogenated TPs. Small classes (< 50 positives) auto-fall-back to the global pool — the `conformal_stratum_used` field records which deck was actually used.
+
+**Per-spectrum confidence.** Per-fragment p-values are combined into a single spectrum-level number. The validator emits four flavours and you pick the one that suits your downstream use:
+
+| Method | Best for | Caveat |
+|--------|----------|--------|
+| `conformal_spectrum_p_hmp` (harmonic-mean p) | Headline confidence — robust under positive dependence between fragments of the same molecule. | Asymptotic null; tightest of the three valid options. |
+| `conformal_spectrum_p_bonferroni` (`min(1, k·p_min)`) | A conservative bound valid under arbitrary dependence. | Often loose, but never wrong. |
+| `conformal_spectrum_p_fisher` (Fisher combined) | Reference / diagnostics. | Assumes independence; anti-conservative on correlated fragments. |
+| `conformal_spectrum_p_min` | Raw minimum p-value across fragments. | No multiplicity correction; useful for sorting only. |
+
+Low spectrum p ⇒ at least one fragment looks suspicious; high spectrum p ⇒ the whole prediction looks like a typical good prediction.
+
+**Optional gate.** Setting `CONFORMAL_LAYER["p_value_gate"] = 0.05` drops strictly-selected fragments whose conformal p falls below 0.05, with rejection reason `below_conformal_p`. Off by default — the layer is purely informational unless you opt in.
+
+**Empirical coverage** on the held-out 310 entries (`fragment_metrics.jsonl` rows where `rank_within_peak == 1` and `is_correct == True`):
+
+| α    | observed reject rate | nominal |
+|------|---------------------|---------|
+| 0.01 | 0.78%               | ≤ 1%    |
+| 0.05 | 3.86%               | ≤ 5%    |
+| 0.10 | 8.92%               | ≤ 10%   |
+| 0.20 | 19.02%              | ≤ 20%   |
+
+Discrimination on the same retained pool: true TPs have mean p ≈ 0.50 (theoretical uniform), true FPs have mean p ≈ 0.11 (52% at p ≤ 0.05).
+
 ---
 
 ## Pipeline Stages (per entry)
@@ -287,5 +428,8 @@ For each entry, `Large_data.py` checks whether PubChem structural data (SMILES/I
 5. **ML correction** — A pre-trained LightGBM model predicts a correctness probability (`ml_prob`) for each assignment based on a rich feature vector.
 6. **Hybrid score** — Combine physics score and ML probability.
 7. **Top-K filter** — Keep only the 20 highest-scoring fragments.
-8. **Validate** — Compare predicted fragment masses to AML reference peaks; compute precision.
-9. **Save** — Write entry-level and fragment-level metrics to disk (if enabled).
+8. **(precision validator only) Strict selection** — One-best-per-peak after hybrid / ML / peak-posterior / acceptance gates, plus an FDR-budgeted rescue stage and a calibrated top-up stage.
+9. **(precision validator only) Final-decision probability** — `FinalDecisionCalibrator` attaches `decision_prob` to each top-1 candidate.
+10. **(precision validator only) Conformal p-value** — `ConformalCalibrator` attaches `conformal_p_global` and `conformal_p_mondrian` per fragment; combines them into per-spectrum `conformal_spectrum_p_{hmp,fisher,bonferroni,min}`.
+11. **Validate** — Compare predicted fragment masses to AML reference peaks; compute precision.
+12. **Save** — Write entry-level and fragment-level metrics to disk (if enabled). Precision runs additionally write `fake_spectra_strict/entry_<id>.json` with per-fragment p-values and a top-level `spectrum_confidence` block.

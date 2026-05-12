@@ -55,6 +55,7 @@ from final_decision_calibrator import (
     build_feature_dict_from_record,
     feature_matrix_from_dicts,
 )
+from heldout_split import load_heldout_test_ids
 
 BASE_DIR = Path("/home/rat/PycharmProjects/SUMFOR_pred/src/Nist_HR/validation_outputs_precision")
 DEFAULT_METRICS_OUT = Path("/home/rat/PycharmProjects/SUMFOR_pred/src/Nist_HR/final_decision_calibrator_metrics.json")
@@ -191,6 +192,21 @@ def main():
     ]
     if not top1_rows:
         raise SystemExit("No top1-per-peak retained candidates found in fragment metrics.")
+
+    heldout_ids = load_heldout_test_ids()
+    if heldout_ids:
+        before = len(top1_rows)
+        top1_rows = [r for r in top1_rows if str(r.get("entry_id")) not in heldout_ids]
+        dropped_entries = len({str(r.get("entry_id")) for r in rows
+                               if str(r.get("entry_id")) in heldout_ids})
+        print(
+            f"Excluded {before - len(top1_rows)} rows from {dropped_entries} "
+            f"held-out test entries (out of {len(heldout_ids)} reserved)."
+        )
+        if not top1_rows:
+            raise SystemExit("All rows were in the held-out test set — nothing left to train on.")
+    else:
+        print("No heldout_test_entries.json found — training on the full row set (NO clean test slice).")
 
     entry_ids = sorted({row["entry_id"] for row in top1_rows})
     pool_ids, val_ids = train_test_split(

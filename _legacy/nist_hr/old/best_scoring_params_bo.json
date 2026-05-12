@@ -1,0 +1,12 @@
+{
+  "w_cation": 0.05492020498318467,
+  "w_hetero": 0.05,
+  "w_aromatic": 0.3182993120496227,
+  "w_masspos": 0.5533572273863486,
+  "w_context": 0.44812595900600644,
+  "w_prior": 0.6,
+  "min_raw_score": 0.15,
+  "margin_sharpness": 12.825240242134301,
+  "depth_penalty": 0.6,
+  "intensity_gamma": 3.0
+}

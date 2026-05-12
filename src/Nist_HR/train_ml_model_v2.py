@@ -25,6 +25,8 @@ from sklearn.metrics import (
 )
 import joblib
 
+from heldout_split import load_heldout_test_ids
+
 TRAIN_CSV = "training_fragments_SIP_hybrid_BDE_v2.csv"
 MODEL_OUT = "ml_correction_model_SIP.txt"
 CALIBRATOR_OUT = "ml_calibrator_v2.pkl"
@@ -40,6 +42,24 @@ df = df.dropna(subset=["frag_mass", "confidence", "parent_mass"])
 print(f"Total rows: {len(df)}")
 print(f"Positive rate: {df['label'].mean():.4f}")
 print(f"Unique entries: {df['entry_id'].nunique()}")
+
+# ------------------------------------------------------------
+# Drop the shared held-out test slice before any split
+# ------------------------------------------------------------
+heldout_ids = load_heldout_test_ids()
+if heldout_ids:
+    entry_id_str = df["entry_id"].astype(str)
+    mask_heldout = entry_id_str.isin(heldout_ids)
+    n_heldout_rows = int(mask_heldout.sum())
+    n_heldout_entries = int(entry_id_str[mask_heldout].nunique())
+    df = df.loc[~mask_heldout].reset_index(drop=True)
+    print(
+        f"Excluded held-out test slice: {n_heldout_rows} rows from "
+        f"{n_heldout_entries} entries (out of {len(heldout_ids)} reserved IDs)."
+    )
+    print(f"Rows after exclusion: {len(df)}")
+else:
+    print("No heldout_test_entries.json found — training on the full dataset (NO clean test slice).")
 
 
 # ------------------------------------------------------------

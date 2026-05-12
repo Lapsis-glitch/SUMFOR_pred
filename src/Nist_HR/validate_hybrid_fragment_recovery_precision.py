@@ -57,7 +57,36 @@ from Large_data import (
 
 MIN_REL_INTENSITY = 0.03
 from chemical_classification import classify_molecule
+from conformal_calibrator import ConformalCalibrator, combine_p_values, parent_class_group
 from final_decision_calibrator import FinalDecisionCalibrator
+from heldout_split import load_heldout_test_ids
+
+
+def _resolve_run_entry_ids(all_ids):
+    """Select which entries this run targets based on $SUMFOR_RUN_MODE.
+
+    Modes:
+      - "all" (default): every entry (legacy behaviour)
+      - "train_pool":    every entry NOT in heldout_test_entries.json
+      - "test_only":     only entries in heldout_test_entries.json
+    """
+    mode = os.environ.get("SUMFOR_RUN_MODE", "all").strip().lower() or "all"
+    if mode == "all":
+        return list(all_ids), "all"
+    heldout = load_heldout_test_ids()
+    if not heldout:
+        print(
+            "  SUMFOR_RUN_MODE requested but heldout_test_entries.json is missing — "
+            "falling back to 'all'."
+        )
+        return list(all_ids), "all"
+    if mode == "train_pool":
+        return [eid for eid in all_ids if str(eid) not in heldout], "train_pool"
+    if mode == "test_only":
+        return [eid for eid in all_ids if str(eid) in heldout], "test_only"
+    raise SystemExit(
+        f"Unknown SUMFOR_RUN_MODE={mode!r}. Use 'all', 'train_pool', or 'test_only'."
+    )
 from formula import Formula
 from chemistry import exact_mass, dbe
 from hybrid_enumerator import HybridEnumerator
@@ -163,6 +192,24 @@ FINAL_DECISION_LAYER = {
     "strict_prob_floor": 0.65,
     "rescue_prob_floor": 0.88,
     "use_prob_for_rescue_fdr": True,
+}
+
+# Conformal-prediction layer: attaches per-fragment p-values testing the TP null
+# (H0 = "fragment is a true positive"). Small p ⇒ looks worse than calibration
+# TPs. The artifact is built by `build_conformal_calibration.py`. If missing
+# or `enabled` is False, the layer is silently skipped and no p-values are
+# attached. Selection / rescue / top-up logic is independent of this layer.
+CONFORMAL_LAYER = {
+    "enabled": True,
+    "artifact_path": "conformal_calibration.pkl",
+    "combine_methods": ("hmp", "fisher", "bonferroni_min", "min"),
+    # Optional gate: drop strictly-selected fragments with p-value below this
+    # threshold. None disables the gate (default — p-values are reported only).
+    "p_value_gate": None,
+    # Which p-value field to use for the gate / for the combined per-spectrum p.
+    # "mondrian" auto-falls back to "global" when the parent-class stratum is too
+    # small (see MIN_STRATUM_N in conformal_calibrator.py).
+    "p_value_for_gate": "mondrian",
 }
 
 RESULTS_OUTPUT = {
@@ -829,7 +876,7 @@ def run_single_entry_precision(entry_id: str):
 
 # ── Precision-oriented selection helpers ─────────────────────
 
-def _select_precision_candidates(assignments, config, parent_classes=None, decision_layer=None):
+def _select_precision_candidates(assignments, config, parent_classes=None, decision_layer=None, conformal_layer=None):
     """
     Build two lists:
       - retained_candidates: top-N per peak for later analysis / rescue
@@ -911,6 +958,13 @@ def _select_precision_candidates(assignments, config, parent_classes=None, decis
                 parent_classes or ["unknown"],
             )
 
+        conformal_p = None
+        if conformal_layer and conformal_layer.get("calibrator") is not None and decision_prob is not None:
+            conformal_p = conformal_layer["calibrator"].p_value(
+                decision_prob,
+                parent_classes or ["unknown"],
+            )
+
         for rank, candidate in enumerate(retained_here, start=1):
             reason = None
             selected = False
@@ -926,6 +980,14 @@ def _select_precision_candidates(assignments, config, parent_classes=None, decis
                 strict_acceptance_floor = class_profile.get("strict_acceptance_floor", 0.0)
                 strict_prob_floor = (decision_layer or {}).get("strict_prob_floor", 0.0)
 
+                conformal_gate = (conformal_layer or {}).get("p_value_gate")
+                conformal_gate_field = (conformal_layer or {}).get("p_value_for_gate", "mondrian")
+                conformal_gate_p = None
+                if conformal_p is not None:
+                    conformal_gate_p = (
+                        conformal_p.get("p_mondrian") if conformal_gate_field == "mondrian" else conformal_p.get("p_global")
+                    )
+
                 if hybrid < config.get("hybrid_thr", 0.0):
                     reason = "below_hybrid_thr"
                 elif ml_prob < config.get("ml_prob_floor", 0.0):
@@ -938,6 +1000,8 @@ def _select_precision_candidates(assignments, config, parent_classes=None, decis
                     reason = "below_decision_prob_floor"
                 elif acceptance_score < strict_acceptance_floor:
                     reason = "below_acceptance_floor"
+                elif conformal_gate is not None and conformal_gate_p is not None and conformal_gate_p < conformal_gate:
+                    reason = "below_conformal_p"
                 else:
                     selected = True
 
@@ -955,6 +1019,11 @@ def _select_precision_candidates(assignments, config, parent_classes=None, decis
                 "acceptance_base_score": acceptance_parts["base_score"] if rank == 1 else None,
                 "acceptance_score": acceptance_parts["acceptance_score"] if rank == 1 else None,
                 "decision_prob": _safe_float(decision_prob) if rank == 1 else None,
+                "conformal_p_global": _safe_float((conformal_p or {}).get("p_global")) if rank == 1 else None,
+                "conformal_p_mondrian": _safe_float((conformal_p or {}).get("p_mondrian")) if rank == 1 else None,
+                "conformal_stratum_requested": (conformal_p or {}).get("stratum_requested") if rank == 1 else None,
+                "conformal_stratum_used": (conformal_p or {}).get("stratum_used") if rank == 1 else None,
+                "conformal_n_calibration_stratum": (conformal_p or {}).get("n_calibration_stratum") if rank == 1 else None,
                 "threshold_profile": class_profile.get("profile_name"),
                 "strict_selected": selected,
                 "rejection_reason": reason,
@@ -1060,8 +1129,15 @@ def _select_precision_candidates(assignments, config, parent_classes=None, decis
     return retained, strict, meta
 
 
-def export_fake_spectrum(entry_id, parent_name, parent_formula, selected_assignments, out_dir):
-    """Export the strict selected fragments as a synthetic HR-like spectrum JSON."""
+def export_fake_spectrum(entry_id, parent_name, parent_formula, selected_assignments, out_dir, meta=None, spectrum_confidence=None):
+    """Export the strict selected fragments as a synthetic HR-like spectrum JSON.
+
+    ``spectrum_confidence`` is an optional dict carrying the spectrum-level
+    conformal combined p-values (HMP / Fisher / Bonferroni / min) and the
+    per-fragment p-value field used to produce them. When provided, each
+    predicted fragment also carries its individual conformal p-values.
+    """
+    meta = meta or {}
     data = {
         "entry_id": entry_id,
         "parent_name": parent_name,
@@ -1075,6 +1151,10 @@ def export_fake_spectrum(entry_id, parent_name, parent_formula, selected_assignm
                 "ml_prob": a.get("ml_prob"),
                 "physics_score": a.get("score"),
                 "peak_posterior": a.get("peak_posterior"),
+                "decision_prob": meta.get(a.get("candidate_id"), {}).get("decision_prob"),
+                "conformal_p_global": meta.get(a.get("candidate_id"), {}).get("conformal_p_global"),
+                "conformal_p_mondrian": meta.get(a.get("candidate_id"), {}).get("conformal_p_mondrian"),
+                "conformal_stratum_used": meta.get(a.get("candidate_id"), {}).get("conformal_stratum_used"),
                 "selection_stage": a.get("selection_stage"),
                 "rescued_rank": a.get("rescued_rank"),
                 "nominal_mz": a.get("nominal_mz"),
@@ -1085,6 +1165,8 @@ def export_fake_spectrum(entry_id, parent_name, parent_formula, selected_assignm
             for a in selected_assignments
         ],
     }
+    if spectrum_confidence is not None:
+        data["spectrum_confidence"] = spectrum_confidence
 
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"entry_{entry_id}.json")
@@ -1103,11 +1185,17 @@ def main():
     fake_spectrum_paths = []
 
     run_start = time.time()
+    run_entry_ids, run_mode = _resolve_run_entry_ids(ENTRY_IDS)
+    if not run_entry_ids:
+        raise SystemExit(f"No entries selected for SUMFOR_RUN_MODE={run_mode!r}.")
+
     run_id = RESULTS_OUTPUT.get("run_name", "auto")
     if run_id == "auto":
-        run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        suffix = "" if run_mode == "all" else f"_{run_mode}"
+        run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + suffix
 
     print("Running precision-oriented hybrid validation...")
+    print(f"  Run mode: {run_mode} ({len(run_entry_ids)} of {len(ENTRY_IDS)} entries)")
     print(f"  Multiplicative hybrid: {USE_MULTIPLICATIVE_HYBRID}")
     print(f"  Complementary-loss filter: {USE_COMPLEMENTARY_LOSS_FILTER}")
     print(f"  Mass-defect filter: {USE_MASS_DEFECT_FILTER}")
@@ -1137,10 +1225,27 @@ def main():
             print(f"  Final decision artifact unavailable; falling back to heuristic mode ({exc})")
             decision_layer["enabled"] = False
 
-    with mp.Pool(processes=N_WORKERS, initializer=_init_worker) as pool:
-        results_iter = pool.imap_unordered(run_single_entry_precision, ENTRY_IDS)
+    conformal_layer = dict(CONFORMAL_LAYER)
+    conformal_layer["calibrator"] = None
+    if CONFORMAL_LAYER.get("enabled"):
+        try:
+            conformal_layer["calibrator"] = ConformalCalibrator(
+                CONFORMAL_LAYER.get("artifact_path", "conformal_calibration.pkl")
+            )
+            summary = conformal_layer["calibrator"].summary()
+            print(
+                f"  Conformal layer enabled: artifact={summary['artifact_path']} "
+                f"n_pos={summary['n_calibration_positive']} "
+                f"strata={list(summary['mondrian_strata'].keys())}"
+            )
+        except Exception as exc:
+            print(f"  Conformal artifact unavailable; p-values will be skipped ({exc})")
+            conformal_layer["enabled"] = False
 
-        for result in tqdm(results_iter, total=len(ENTRY_IDS), desc="Validating", unit="entry"):
+    with mp.Pool(processes=N_WORKERS, initializer=_init_worker) as pool:
+        results_iter = pool.imap_unordered(run_single_entry_precision, run_entry_ids)
+
+        for result in tqdm(results_iter, total=len(run_entry_ids), desc="Validating", unit="entry"):
             if result is None:
                 continue
 
@@ -1155,6 +1260,7 @@ def main():
                 STRICT_SELECTION,
                 parent_classes=parent_classes,
                 decision_layer=decision_layer,
+                conformal_layer=conformal_layer,
             )
 
             strict_correct = 0
@@ -1228,6 +1334,11 @@ def main():
                         "acceptance_base_score": _safe_float(info.get("acceptance_base_score")),
                         "acceptance_score": _safe_float(info.get("acceptance_score")),
                         "decision_prob": _safe_float(info.get("decision_prob")),
+                        "conformal_p_global": _safe_float(info.get("conformal_p_global")),
+                        "conformal_p_mondrian": _safe_float(info.get("conformal_p_mondrian")),
+                        "conformal_stratum_requested": info.get("conformal_stratum_requested"),
+                        "conformal_stratum_used": info.get("conformal_stratum_used"),
+                        "conformal_n_calibration_stratum": info.get("conformal_n_calibration_stratum"),
                         "threshold_profile": info.get("threshold_profile"),
                         "rule_penalty_detail": info.get("rule_penalty_detail"),
                         "ambiguity_penalty_detail": info.get("ambiguity_penalty_detail"),
@@ -1280,6 +1391,8 @@ def main():
                 strict_hybrid_vals = [_safe_float(a.get("hybrid_score")) for a in strict_selected]
                 strict_posterior_vals = [_safe_float(meta[a["candidate_id"]].get("peak_posterior")) for a in strict_selected]
                 strict_decision_vals = [_safe_float(meta[a["candidate_id"]].get("decision_prob")) for a in strict_selected]
+                strict_p_global_vals = [_safe_float(meta[a["candidate_id"]].get("conformal_p_global")) for a in strict_selected]
+                strict_p_mondrian_vals = [_safe_float(meta[a["candidate_id"]].get("conformal_p_mondrian")) for a in strict_selected]
                 rescued_count = sum(1 for a in strict_selected if meta[a["candidate_id"]].get("selection_stage") == "rescued")
                 rescued_correct_count = sum(
                     1
@@ -1295,6 +1408,19 @@ def main():
                 hybrid_mean, _, _ = _score_stats(strict_hybrid_vals)
                 posterior_mean, _, _ = _score_stats(strict_posterior_vals)
                 decision_mean, _, _ = _score_stats(strict_decision_vals)
+
+                combine_methods = CONFORMAL_LAYER.get("combine_methods", ("hmp", "fisher", "bonferroni_min", "min"))
+                p_field_for_gate = CONFORMAL_LAYER.get("p_value_for_gate", "mondrian")
+                primary_p_vals = strict_p_mondrian_vals if p_field_for_gate == "mondrian" else strict_p_global_vals
+                primary_p_clean = [p for p in primary_p_vals if p is not None]
+                spectrum_p = {
+                    method: (
+                        combine_p_values(primary_p_clean, method=method)
+                        if primary_p_clean else None
+                    )
+                    for method in combine_methods
+                }
+                spectrum_p_min = float(min(primary_p_clean)) if primary_p_clean else None
 
                 entry_records.append({
                     "schema_version": RESULTS_OUTPUT.get("schema_version", "2.0"),
@@ -1320,6 +1446,13 @@ def main():
                     "hybrid_score_mean": hybrid_mean,
                     "peak_posterior_mean": posterior_mean,
                     "decision_prob_mean": decision_mean,
+                    "conformal_p_global_mean": _score_stats(strict_p_global_vals)[0],
+                    "conformal_p_mondrian_mean": _score_stats(strict_p_mondrian_vals)[0],
+                    "conformal_spectrum_p_min": spectrum_p_min,
+                    "conformal_spectrum_p_hmp": spectrum_p.get("hmp"),
+                    "conformal_spectrum_p_fisher": spectrum_p.get("fisher"),
+                    "conformal_spectrum_p_bonferroni": spectrum_p.get("bonferroni_min"),
+                    "conformal_p_field_for_combined": p_field_for_gate,
                     "threshold_profile": "+".join(["default"] + [cls for cls in parent_classes if cls in STRICT_SELECTION.get("class_threshold_overrides", {})]),
                     "strict_hybrid_thr": STRICT_SELECTION["hybrid_thr"],
                     "strict_ml_prob_floor": STRICT_SELECTION["ml_prob_floor"],
@@ -1334,12 +1467,24 @@ def main():
             if RESULTS_OUTPUT.get("enabled") and RESULTS_OUTPUT.get("include_fake_spectra", False):
                 run_dir = os.path.join(RESULTS_OUTPUT.get("out_dir", "validation_outputs_precision"), run_id)
                 fake_dir = os.path.join(run_dir, RESULTS_OUTPUT.get("fake_spectra_dirname", "fake_spectra_strict"))
+                spectrum_confidence = None
+                if conformal_layer.get("calibrator") is not None:
+                    spectrum_confidence = {
+                        "p_value_field": CONFORMAL_LAYER.get("p_value_for_gate", "mondrian"),
+                        "combined_hmp": spectrum_p.get("hmp"),
+                        "combined_fisher": spectrum_p.get("fisher"),
+                        "combined_bonferroni_min": spectrum_p.get("bonferroni_min"),
+                        "min_p": spectrum_p_min,
+                        "n_fragments": len(strict_selected),
+                    }
                 path = export_fake_spectrum(
                     entry_id=eid,
                     parent_name=result["parent_name"],
                     parent_formula=parent_formula,
                     selected_assignments=strict_selected,
                     out_dir=fake_dir,
+                    meta=meta,
+                    spectrum_confidence=spectrum_confidence,
                 )
                 fake_spectrum_paths.append(path)
 
@@ -1366,6 +1511,38 @@ def main():
         print(f"  Mean correct  : {corr_arr.mean():.2f}")
     else:
         print("\nNo strict predictions passed the precision gates.")
+
+    if conformal_layer.get("calibrator") is not None:
+        primary_field = (
+            "conformal_p_mondrian"
+            if CONFORMAL_LAYER.get("p_value_for_gate", "mondrian") == "mondrian"
+            else "conformal_p_global"
+        )
+        spectrum_field = (
+            "conformal_spectrum_p_hmp"
+            if "hmp" in CONFORMAL_LAYER.get("combine_methods", ())
+            else "conformal_spectrum_p_fisher"
+        )
+        per_frag_p = [r.get(primary_field) for r in fragment_records if r.get("selected_strict") and r.get(primary_field) is not None]
+        per_spec_p = [r.get(spectrum_field) for r in entry_records if r.get(spectrum_field) is not None]
+        if per_frag_p:
+            arr_p = np.array(per_frag_p, dtype=float)
+            print("\n--- Conformal per-fragment p-values (strictly selected, primary={}) ---".format(primary_field))
+            print(f"  n      : {arr_p.size}")
+            print(f"  Mean   : {arr_p.mean():.4f}")
+            print(f"  Median : {np.median(arr_p):.4f}")
+            for alpha in (0.01, 0.05, 0.10, 0.20):
+                frac = float(np.mean(arr_p <= alpha))
+                print(f"  P(p<={alpha:.2f}): {frac:.4f}  (n={int((arr_p <= alpha).sum())})")
+        if per_spec_p:
+            arr_s = np.array(per_spec_p, dtype=float)
+            print("\n--- Conformal spectrum-level combined p ({}) ---".format(spectrum_field))
+            print(f"  n      : {arr_s.size}")
+            print(f"  Mean   : {arr_s.mean():.4f}")
+            print(f"  Median : {np.median(arr_s):.4f}")
+            for alpha in (0.01, 0.05, 0.10, 0.20):
+                frac = float(np.mean(arr_s <= alpha))
+                print(f"  P(p<={alpha:.2f}): {frac:.4f}  (n={int((arr_s <= alpha).sum())})")
 
     import matplotlib
     matplotlib.use("Agg")  # headless: save figures, never pop windows
@@ -1440,12 +1617,17 @@ def main():
                 "final_decision_layer": {
                     k: v for k, v in FINAL_DECISION_LAYER.items() if k != "calibrator"
                 },
+                "conformal_layer": {
+                    k: v for k, v in CONFORMAL_LAYER.items() if k != "calibrator"
+                },
                 "use_multiplicative_hybrid": USE_MULTIPLICATIVE_HYBRID,
                 "use_complementary_loss_filter": USE_COMPLEMENTARY_LOSS_FILTER,
                 "use_mass_defect_filter": USE_MASS_DEFECT_FILTER,
                 "notes": RESULTS_OUTPUT.get("notes", []),
             },
             "counts": {
+                "run_mode": run_mode,
+                "entries_in_run_mode": len(run_entry_ids),
                 "entries_total": len(ENTRY_IDS),
                 "entries_processed": len(entry_records),
                 "entries_with_strict_predictions": len(arr),
