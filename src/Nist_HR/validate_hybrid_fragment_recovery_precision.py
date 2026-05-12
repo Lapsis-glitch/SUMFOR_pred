@@ -81,8 +81,8 @@ STRICT_SELECTION = {
     "candidate_hybrid_floor": None,  # None → retain top-N regardless of score
     "min_frags_per_entry": None,     # legacy unconditional rescue (replaced by calibrated top-up below)
     "topup_target_count": 7,         # calibrated top-up target frags per entry
-    "topup_prob_floor": 0.65,        # decision_prob floor for top-up candidates
-    "topup_max_expected_fdr": 0.08,  # cumulative expected FDR budget for top-up additions
+    "topup_prob_floor": 0.55,        # decision_prob floor for top-up candidates
+    "topup_max_expected_fdr": 0.12,  # cumulative expected FDR budget for top-up additions
     "rescue_hybrid_floor": 0.55,
     "rescue_ml_prob_floor": 0.50,
     "rescue_posterior_floor": 0.50,
@@ -160,7 +160,7 @@ STRICT_SELECTION = {
 FINAL_DECISION_LAYER = {
     "enabled": True,
     "artifact_path": "final_decision_calibrator.pkl",
-    "strict_prob_floor": 0.75,
+    "strict_prob_floor": 0.65,
     "rescue_prob_floor": 0.88,
     "use_prob_for_rescue_fdr": True,
 }
